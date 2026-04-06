@@ -277,6 +277,11 @@ async function handleMessage(
 
   // ── CARD_SPAWN fast path ──────────────────────────────────
   if (trace.result?.templateId === 'CARD_SPAWN') {
+    if (!groupJid) {
+      console.log(`[CARD] CARD_SPAWN in DM from ${senderJid} — ignored`);
+      return;
+    }
+
     const f = trace.result.fields as {
       cardName: string;
       tier:     string | number;
@@ -284,7 +289,7 @@ async function handleMessage(
       spawnId:  string;
       issue:    number;
     };
-    const targetGroup = groupJid ?? remoteJid;
+    const targetGroup = groupJid;
 
     // Per-spawnId dedup — if we already attempted this spawn, ignore
     if (attemptedSpawns.has(f.spawnId)) {
@@ -300,17 +305,25 @@ async function handleMessage(
 
     // ── Claim flow: pause → type → decide → fire → retry ─────
     void (async () => {
-      // Bot registration gate — test GC bypasses, real GCs require known_bots OR name list
-      const isTestGc  = groupJid !== null && groupJid === testGcJid;
-      const nameMatch = BOT_NAMES.has(msg.pushName?.trim() ?? '');
-      if (!isTestGc && !nameMatch) {
+      // Bot registration gate — test GC bypasses, real GCs require known_bots (JID check)
+      const isTestGc = groupJid !== null && groupJid === testGcJid;
+      if (!isTestGc) {
         const { data: botRow } = await db
           .from('known_bots')
           .select('jid')
           .eq('jid', normalizeJid(senderJid))
           .maybeSingle();
         if (!botRow) {
-          console.log(`[CARD] ${f.spawnId} — unregistered sender "${msg.pushName ?? senderJid}" — skipping claim`);
+          // If name matches known bot list, auto-register for next time but skip this claim
+          if (BOT_NAMES.has(msg.pushName?.trim() ?? '')) {
+            await db.from('known_bots').upsert(
+              { jid: normalizeJid(senderJid), number: getNumber(senderJid), status: 'unverified' },
+              { onConflict: 'jid' },
+            );
+            console.log(`[BOT AUTO-REG] "${msg.pushName}" registered as unverified — skipping this claim`);
+          } else {
+            console.log(`[CARD] ${f.spawnId} — unregistered sender "${msg.pushName ?? senderJid}" — skipping claim`);
+          }
           claimInFlight.delete(targetGroup);
           return;
         }
