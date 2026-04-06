@@ -32,6 +32,7 @@ import {
 import { createImager } from '@mariabelle/imager';
 import { db }                from './db.js';
 import { initClaimer }       from './claimer.js';
+import { createCleaner }     from './cleaner.js';
 import { createActivityLog } from '@mariabelle/activity-log';
 import { detectCard }        from '@mariabelle/card-detector';
 import Jimp                  from 'jimp';
@@ -95,6 +96,11 @@ let isShuttingDown  = false;
 // ── Message deduplication ────────────────────────────────────
 const processedMessageIds = new Set<string>();
 
+// ── LID → phone JID mapping (persisted in memory, grows as messages arrive) ──
+// Populated from key.participantAlt / key.remoteJidAlt (most reliable source).
+// Fallback: signalRepository.lidMapping.getPNForLID (only works after history sync).
+const lidMap = new Map<string, string>(); // lid@lid → number@s.whatsapp.net
+
 // ── Registered bot names (hardcoded safety net) ──────────────
 const BOT_NAMES = new Set([
   'Alya','Aqua','Asuna','Elaina','Frieren','Kurumi','Mai','Marin',
@@ -143,7 +149,22 @@ async function connectToWhatsApp(): Promise<void> {
     },
   }, { loopIntervalMs: 4000 });
 
-  const claimer = initClaimer(sock, typingSim);
+  const claimer  = initClaimer(sock, typingSim);
+  const cleaner  = createCleaner(db, sock, lidMap);
+
+  // ── LID resolver ─────────────────────────────────────────────
+  // Priority: participantAlt/remoteJidAlt (set per-message before calling this)
+  // → signalRepository.lidMapping (populated after history sync)
+  // → raw LID as last resort
+  async function resolveJid(rawJid: string): Promise<string> {
+    if (!rawJid.endsWith('@lid')) return rawJid;
+    if (lidMap.has(rawJid)) return lidMap.get(rawJid)!;
+    try {
+      const pn = await sock.signalRepository?.lidMapping?.getPNForLID(rawJid);
+      if (pn) { lidMap.set(rawJid, pn); return pn; }
+    } catch { /* not yet mapped */ }
+    return rawJid; // unresolved — stays as LID
+  }
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -182,7 +203,7 @@ async function connectToWhatsApp(): Promise<void> {
     if (type !== 'notify') return;
     for (const msg of messages) {
       if (!msg.message) continue;
-      handleMessage(msg, sock, classifier, claimer, typingSim, selfNumber).catch(err => {
+      handleMessage(msg, sock, classifier, claimer, typingSim, selfNumber, resolveJid).catch(err => {
         console.error('[MSG] Error:', (err as Error).message);
       });
     }
@@ -197,6 +218,7 @@ async function handleMessage(
   claimer:     ReturnType<typeof initClaimer>,
   typingSim:   TypingSimulator,
   selfNumber:  string,
+  resolveJid:  (jid: string) => Promise<string>,
 ): Promise<void> {
 
   const messageId = msg.key.id ?? null;
@@ -220,10 +242,35 @@ async function handleMessage(
   const hasImage  = !!msg.message?.imageMessage;
   const remoteJid = msg.key.remoteJid ?? '';
   const fromMe    = msg.key.fromMe === true;
-  const senderJid = fromMe
+
+  // Populate lidMap from the most reliable source before resolving
+  const altParticipant = (msg.key as Record<string, unknown>)['participantAlt'] as string | undefined;
+  const altRemote      = (msg.key as Record<string, unknown>)['remoteJidAlt']   as string | undefined;
+  const rawSender = fromMe
     ? (selfNumber + '@s.whatsapp.net')
     : (msg.key.participant ?? remoteJid);
+
+  if (altParticipant && rawSender.endsWith('@lid')) lidMap.set(rawSender, altParticipant);
+  if (altRemote      && remoteJid.endsWith('@lid'))  lidMap.set(remoteJid, altRemote);
+
+  const senderJid = fromMe
+    ? (selfNumber + '@s.whatsapp.net')
+    : await resolveJid(rawSender);
   const groupJid  = isGroupJid(remoteJid) ? remoteJid : null;
+  const rawLid    = rawSender.endsWith('@lid') ? rawSender : null;
+
+  // ── RAW MESSAGE DEBUG ─────────────────────────────────────
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('pushName      :', msg.pushName ?? 'NULL');
+  console.log('remoteJid     :', msg.key.remoteJid);
+  console.log('participant   :', msg.key.participant ?? 'NULL');
+  console.log('remoteJidAlt  :', altRemote      ?? 'NULL');
+  console.log('participantAlt:', altParticipant ?? 'NULL');
+  console.log('rawSender     :', rawSender);
+  console.log('senderJid     :', senderJid);
+  console.log('isLid         :', rawSender.endsWith('@lid'));
+  console.log('text preview  :', rawText?.slice(0, 60) ?? 'NULL');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   // Test GC image detection — handle before rawText guard
   if (hasImage && groupJid && groupJid === testGcJid) {
@@ -317,7 +364,7 @@ async function handleMessage(
           // If name matches known bot list, auto-register for next time but skip this claim
           if (BOT_NAMES.has(msg.pushName?.trim() ?? '')) {
             await db.from('known_bots').upsert(
-              { jid: normalizeJid(senderJid), number: getNumber(senderJid), status: 'unverified' },
+              { jid: normalizeJid(senderJid), lid: rawLid, number: getNumber(senderJid), moniker: msg.pushName ?? null, status: 'unverified' },
               { onConflict: 'jid' },
             );
             console.log(`[BOT AUTO-REG] "${msg.pushName}" registered as unverified — skipping this claim`);
@@ -484,7 +531,7 @@ async function handleMessage(
   // Auto-discovery: BOT_PING
   if (trace.result?.templateId === 'BOT_PING') {
     await db.from('known_bots').upsert(
-      { jid: normalizeJid(senderJid), number: getNumber(senderJid), status: 'verified' },
+      { jid: normalizeJid(senderJid), lid: rawLid, number: getNumber(senderJid), moniker: msg.pushName ?? null, status: 'verified' },
       { onConflict: 'jid' },
     );
     classifier.invalidate(senderJid);
@@ -497,7 +544,7 @@ async function handleMessage(
       && trace.result !== null
       && BOT_ONLY_TEMPLATES.has(trace.result.templateId)) {
     await db.from('known_bots').upsert(
-      { jid: normalizeJid(senderJid), number: getNumber(senderJid), status: 'unverified' },
+      { jid: normalizeJid(senderJid), lid: rawLid, number: getNumber(senderJid), moniker: msg.pushName ?? null, status: 'unverified' },
       { onConflict: 'jid' },
     );
     classifier.invalidate(senderJid);
@@ -635,6 +682,16 @@ async function handleMessage(
         // 4. Fire (message first, then stop typing — no gap)
         await sock.sendMessage(groupJid, { text: `✅ FIRED\n${summary}\nTotal: ${Math.round((Date.now() - typingStartedAt + pauseMs) / 1000)}s from spawn` });
         typingSim.stopLoop(groupJid);
+      })();
+      return;
+    }
+
+    // .clean — fix LIDs, missing monikers, and unnamed groups in the DB
+    if (cmd === '.clean' && groupJid === testGcJid) {
+      void (async () => {
+        await sock.sendMessage(groupJid, { text: '🧹 Cleaning…' });
+        const summary = await cleaner.clean();
+        await sock.sendMessage(groupJid, { text: `✅ Done\n${summary}` });
       })();
       return;
     }

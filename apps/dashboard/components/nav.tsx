@@ -24,7 +24,7 @@ const NAV: NavItem[] = [
   { href: '/activity',      label: 'Activity',        Icon: Activity,          badge: 'live' },
   { href: '/card-detector', label: 'Card Detector',   Icon: FlaskConical,      badge: 'lab'  },
   { href: '/gambling',      label: 'Gambling',        Icon: TrendingUp,        badge: 'soon' },
-  { href: '/bots',          label: 'Bots',            Icon: Bot,               badge: 'soon' },
+  { href: '/bots',          label: 'Bots',            Icon: Bot,               badge: 'live' },
   { href: '/errors',        label: 'Errors',          Icon: AlertTriangle,     badge: 'soon' },
   { href: '/leaderboard',   label: 'Leaderboard',     Icon: Trophy,            badge: 'soon' },
   { href: '/control',       label: 'Control',         Icon: SlidersHorizontal, badge: 'live' },
