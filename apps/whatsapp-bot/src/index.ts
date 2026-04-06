@@ -95,6 +95,12 @@ let isShuttingDown  = false;
 // ── Message deduplication ────────────────────────────────────
 const processedMessageIds = new Set<string>();
 
+// ── Registered bot names (hardcoded safety net) ──────────────
+const BOT_NAMES = new Set([
+  'Alya','Aqua','Asuna','Elaina','Frieren','Kurumi','Mai','Marin',
+  'Megumin','Mita','Miyabi','Modeus','Nazuna','Rem','Rimuru','Rin','Yuki',
+]);
+
 // ── Claim guards ─────────────────────────────────────────────
 const claimInFlight   = new Set<string>(); // groupJid → claim in progress
 const claimCancelled  = new Set<string>(); // groupJid → abort signal for in-flight claim
@@ -294,6 +300,22 @@ async function handleMessage(
 
     // ── Claim flow: pause → type → decide → fire → retry ─────
     void (async () => {
+      // Bot registration gate — test GC bypasses, real GCs require known_bots OR name list
+      const isTestGc  = groupJid !== null && groupJid === testGcJid;
+      const nameMatch = BOT_NAMES.has(msg.pushName?.trim() ?? '');
+      if (!isTestGc && !nameMatch) {
+        const { data: botRow } = await db
+          .from('known_bots')
+          .select('jid')
+          .eq('jid', normalizeJid(senderJid))
+          .maybeSingle();
+        if (!botRow) {
+          console.log(`[CARD] ${f.spawnId} — unregistered sender "${msg.pushName ?? senderJid}" — skipping claim`);
+          claimInFlight.delete(targetGroup);
+          return;
+        }
+      }
+
       const tier = String(f.tier);
 
       // 1. Decide immediately — during the invisible pre-typing pause
@@ -337,6 +359,7 @@ async function handleMessage(
       // 8. Fire — message first, stop typing after (no gap)
       await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
       typingSim.stopLoop(targetGroup);
+      claimInFlight.delete(targetGroup); // release group — new spawns can be claimed now
       console.log(`[CLAIMER] .claim ${f.spawnId} sent`);
 
       // 9. ntfy push notification
