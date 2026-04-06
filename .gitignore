@@ -1,0 +1,29 @@
+# Environment variables — never commit
+.env
+.env.local
+.env.*.local
+
+# Auth session — contains WhatsApp keys
+apps/whatsapp-bot/auth/
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+**/dist/
+.next/
+**/.next/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,31 @@
+{
+  "name": "@mariabelle/whatsapp-bot",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file=.env --import=tsx/esm src/index.ts",
+    "build": "tsc",
+    "start": "node --env-file=.env dist/index.js"
+  },
+  "dependencies": {
+    "@mariabelle/activity-log": "file:../../packages/activity-log",
+    "@mariabelle/card-detector": "file:../../packages/card-detector",
+    "jimp": "0.22.12",
+    "@mariabelle/humaniser": "file:../../packages/humaniser",
+    "@mariabelle/identifier": "file:../../packages/identifier",
+    "@mariabelle/imager": "file:../../packages/imager",
+    "@mariabelle/parser": "file:../../packages/parser",
+    "@supabase/supabase-js": "^2.99.2",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "@hapi/boom": "^10.0.1",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@mariabelle/claimer",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@mariabelle/card-detector": "file:../card-detector",
+    "@mariabelle/activity-log":  "file:../activity-log",
+    "@mariabelle/humaniser":     "file:../humaniser"
+  },
+  "peerDependencies": {
+    "@whiskeysockets/baileys": "^7",
+    "@supabase/supabase-js": "^2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

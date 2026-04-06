@@ -1,0 +1,11 @@
+{
+  "name": "mariabelle-v2",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "test": "pnpm --filter @mariabelle/parser test"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  }
+}
