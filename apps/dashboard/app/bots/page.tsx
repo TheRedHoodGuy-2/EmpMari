@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { Trash2, Plus, RefreshCw } from 'lucide-react';
+import { supabase } from '@/lib/supabase';
 
 type GcEntry = { id: string; name: string | null };
 
@@ -42,7 +43,38 @@ export default function BotsPage() {
     setLoading(false);
   }
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    void load();
+
+    // Live updates — new bot registered or existing bot updated
+    const channel = supabase
+      .channel('known_bots_live')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'known_bots' },
+        async (payload) => {
+          if (payload.eventType === 'DELETE') {
+            setBots(prev => prev.filter(b => b.id !== (payload.old as Bot).id));
+            return;
+          }
+          // INSERT or UPDATE — re-fetch this single bot with groups enriched
+          const row = payload.new as Bot;
+          const res = await fetch('/api/known-bots');
+          if (!res.ok) return;
+          const all = await res.json() as Bot[];
+          const updated = all.find(b => b.id === row.id);
+          if (!updated) return;
+          setBots(prev => {
+            const exists = prev.find(b => b.id === updated.id);
+            if (exists) return prev.map(b => b.id === updated.id ? updated : b);
+            return [updated, ...prev];
+          });
+        },
+      )
+      .subscribe();
+
+    return () => { void supabase.removeChannel(channel); };
+  }, []);
 
   async function remove(bot: Bot) {
     setBots(prev => prev.filter(b => b.id !== bot.id));

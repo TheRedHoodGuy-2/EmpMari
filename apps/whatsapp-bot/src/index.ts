@@ -112,6 +112,14 @@ const claimInFlight   = new Set<string>(); // groupJid → claim in progress
 const claimCancelled  = new Set<string>(); // groupJid → abort signal for in-flight claim
 const attemptedSpawns = new Set<string>(); // spawnId  → already attempted, never retry
 
+// ── High-tier always-claim brackets (T4/5/6/S bypass humaniser) ──
+const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
+const CLAIM_BRACKETS = [
+  { minMs: 1400, maxMs: 1800 }, // fast bracket
+  { minMs: 1600, maxMs: 2000 }, // mid bracket
+  { minMs: 1800, maxMs: 2200 }, // slow bracket
+];
+
 // ── Activity log + humaniser ──────────────────────────────────
 const activityLog = createActivityLog(db);
 const humaniser   = createHumaniser(db);
@@ -380,11 +388,28 @@ async function handleMessage(
 
       // 1. Decide immediately — during the invisible pre-typing pause
       const activityScore = (await activityLog.getScore(targetGroup)).score;
-      const decision = await humaniser.decide({
-        tier, design: 'unknown', issue: f.issue, activityScore,
-      });
+
+      let decision: { shouldClaim: boolean; reason: string; delayMs: number };
+
+      if (HIGH_TIERS.has(tier)) {
+        // High-tier: always claim, bypass humaniser DB config
+        const bracket = CLAIM_BRACKETS[Math.floor(Math.random() * CLAIM_BRACKETS.length)]!;
+        const delayMs = bracket.minMs + Math.floor(Math.random() * (bracket.maxMs - bracket.minMs));
+        decision = { shouldClaim: true, reason: `T${tier} — always claim`, delayMs };
+      } else {
+        decision = await humaniser.decide({
+          tier, design: 'unknown', issue: f.issue, activityScore,
+        });
+      }
 
       console.log(`[CARD] ${f.cardName} (${f.spawnId}) T${tier} #${f.issue} — ${decision.shouldClaim ? 'CLAIMING' : 'SKIPPING'} | ${decision.reason}`);
+
+      // Store decision in card_events (fire-and-forget)
+      void db.from('card_events').update({
+        decision_should_claim: decision.shouldClaim,
+        decision_reason:       decision.reason,
+        decision_delay_ms:     decision.delayMs,
+      }).eq('spawn_id', f.spawnId);
 
       // 2. If skipping — do nothing, no typing flash, no tell
       if (!decision.shouldClaim) {
@@ -783,13 +808,16 @@ async function handleMessage(
     if (quotedMessageId) {
       const { data: quotedRow, error: qErr } = await db
         .from('parse_log')
-        .select('sender_jid, fields_json')
+        .select('sender_jid, fields_json, raw_text')
         .eq('message_id', quotedMessageId)
         .maybeSingle();
       if (qErr) console.error('[CLAIM_SUCCESS] quotedRow lookup error:', qErr.message);
       if (quotedRow) {
         claimerJid = quotedRow.sender_jid as string;
-        spawnId    = (quotedRow.fields_json as { spawnId?: string } | null)?.spawnId ?? null;
+        // Try fields_json first (spawn message), then parse spawnId from raw .claim text
+        spawnId = (quotedRow.fields_json as { spawnId?: string } | null)?.spawnId
+          ?? (quotedRow.raw_text as string | null)?.match(/\.claim\s+([a-z0-9]+)/i)?.[1]
+          ?? null;
       }
     }
 
@@ -810,11 +838,20 @@ async function handleMessage(
 
     if (spawnId) {
       claimer.confirm(spawnId);
+      // claim_source = 'bot' only when the success is tagged to the bot's own claim message
+      const selfJid    = selfNumber + '@s.whatsapp.net';
+      const claimSource = claimerJid && normalizeJid(claimerJid) === normalizeJid(selfJid) ? 'bot' : 'other';
       const { error: updateErr } = await db.from('card_events')
-        .update({ claimed: true, claimed_at: new Date().toISOString(), claimer_jid: claimerJid, claim_log_id: parseLogId })
+        .update({
+          claimed:      true,
+          claim_source: claimSource,
+          claimed_at:   new Date().toISOString(),
+          claimer_jid:  claimerJid,
+          claim_log_id: parseLogId,
+        })
         .eq('spawn_id', spawnId);
       if (updateErr) console.error('[CLAIM_SUCCESS] update failed:', updateErr.message);
-      else console.log(`[CLAIMED] ${spawnId} by ${claimerJid ? formatDisplay(claimerJid) : 'unknown'}`);
+      else console.log(`[CLAIMED] ${spawnId} | source=${claimSource} | by ${claimerJid ? formatDisplay(claimerJid) : 'unknown'}`);
     } else {
       console.warn('[CLAIM_SUCCESS] could not resolve spawnId');
     }

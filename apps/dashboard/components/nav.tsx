@@ -26,7 +26,7 @@ const NAV: NavItem[] = [
   { href: '/gambling',      label: 'Gambling',        Icon: TrendingUp,        badge: 'soon' },
   { href: '/bots',          label: 'Bots',            Icon: Bot,               badge: 'live' },
   { href: '/errors',        label: 'Errors',          Icon: AlertTriangle,     badge: 'soon' },
-  { href: '/leaderboard',   label: 'Leaderboard',     Icon: Trophy,            badge: 'soon' },
+  { href: '/leaderboard',   label: 'Leaderboard',     Icon: Trophy,            badge: 'live' },
   { href: '/control',       label: 'Control',         Icon: SlidersHorizontal, badge: 'live' },
 ];
 

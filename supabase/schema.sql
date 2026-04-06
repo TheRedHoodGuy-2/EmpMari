@@ -67,21 +67,31 @@ CREATE INDEX IF NOT EXISTS idx_parse_log_sender_jid   ON parse_log (sender_jid);
 
 -- ── card_events ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS card_events (
-  id           uuid        DEFAULT gen_random_uuid() PRIMARY KEY,
-  created_at   timestamptz DEFAULT now(),
-  group_id     text        NOT NULL,
-  spawn_id     text        UNIQUE NOT NULL,
-  card_name    text,
-  tier         text,
-  price        int,
-  issue        int,
-  image_url    text,
-  spawn_log_id uuid        REFERENCES parse_log(id),
-  claimed      boolean     DEFAULT false,
-  claimed_at   timestamptz,
-  claimer_jid  text,
-  claim_log_id uuid        REFERENCES parse_log(id)
+  id                   uuid        DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at           timestamptz DEFAULT now(),
+  group_id             text        NOT NULL,
+  spawn_id             text        UNIQUE NOT NULL,
+  card_name            text,
+  tier                 text,
+  price                int,
+  issue                int,
+  image_url            text,
+  spawn_log_id         uuid        REFERENCES parse_log(id),
+  -- Humaniser decision
+  decision_should_claim boolean,
+  decision_reason      text,
+  decision_delay_ms    int,
+  -- Claim outcome
+  claimed              boolean     DEFAULT false,
+  claim_source         text        CHECK (claim_source IN ('bot', 'other')),
+  claimed_at           timestamptz,
+  claimer_jid          text,
+  claim_log_id         uuid        REFERENCES parse_log(id)
 );
+ALTER TABLE card_events ADD COLUMN IF NOT EXISTS decision_should_claim boolean;
+ALTER TABLE card_events ADD COLUMN IF NOT EXISTS decision_reason       text;
+ALTER TABLE card_events ADD COLUMN IF NOT EXISTS decision_delay_ms     int;
+ALTER TABLE card_events ADD COLUMN IF NOT EXISTS claim_source          text CHECK (claim_source IN ('bot', 'other'));
 
 -- ── Row Level Security ────────────────────────────────────────
 ALTER TABLE players      ENABLE ROW LEVEL SECURITY;
@@ -104,6 +114,16 @@ DO $$ BEGIN
 END $$;
 
 -- ── Realtime ──────────────────────────────────────────────────
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime' AND tablename = 'known_bots'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE known_bots;
+  END IF;
+END $$;
+
 DO $$
 BEGIN
   IF NOT EXISTS (

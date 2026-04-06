@@ -1,6 +1,8 @@
 'use client';
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
+import { useGroupNames } from '@/lib/use-group-names';
+import { Trash2 } from 'lucide-react';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -17,6 +19,10 @@ type CardEvent = {
   claimed: boolean;
   claimed_at: string | null;
   claimer_jid: string | null;
+  claim_source: 'bot' | 'other' | null;
+  decision_should_claim: boolean | null;
+  decision_reason: string | null;
+  decision_delay_ms: number | null;
 };
 
 type Filter = 'all' | 'unclaimed' | 'claimed';
@@ -85,17 +91,47 @@ async function downloadImage(url: string, filename: string): Promise<void> {
 
 // ── Card tile ─────────────────────────────────────────────────
 
-function CardTile({ card, tick }: { card: CardEvent; tick: number }) {
+function CardTile({ card, tick, onDelete, groupName }: { card: CardEvent; tick: number; onDelete: (id: string) => void; groupName: string }) {
   void tick;
   const [expanded, setExpanded] = useState(false);
+  const [hovered,  setHovered]  = useState(false);
   const ts = getTierStyle(card.tier);
 
+  async function handleDelete() {
+    onDelete(card.id); // optimistic
+    await fetch(`/api/card-events/${card.id}`, { method: 'DELETE' });
+  }
+
   const statusPill = card.claimed
-    ? { label: 'Claimed',   bg: 'var(--green-dim)', color: 'var(--green)' }
-    : { label: 'Unclaimed', bg: 'var(--amber-dim)', color: 'var(--amber)' };
+    ? card.claim_source === 'bot'
+      ? { label: 'Bot claimed',   bg: 'var(--blue-dim)',  color: 'var(--blue)'  }
+      : { label: 'Other claimed', bg: 'var(--green-dim)', color: 'var(--green)' }
+    : card.decision_should_claim === false
+      ? { label: 'Skipped',   bg: 'rgba(255,255,255,0.06)', color: 'var(--muted)' }
+      : { label: 'Unclaimed', bg: 'var(--amber-dim)',        color: 'var(--amber)' };
 
   return (
-    <div className="card" style={{ padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+    <div
+      className="card"
+      style={{ padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', position: 'relative' }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      {/* Delete button — appears on hover */}
+      {hovered && (
+        <button
+          onClick={e => { e.stopPropagation(); void handleDelete(); }}
+          title="Delete card"
+          style={{
+            position: 'absolute', top: 8, right: card.image_url ? 40 : 8, zIndex: 10,
+            background: 'rgba(0,0,0,0.6)', border: 'none', borderRadius: 6,
+            padding: '4px 7px', cursor: 'pointer', color: '#ef4444',
+            backdropFilter: 'blur(4px)',
+          }}
+        >
+          <Trash2 size={13} />
+        </button>
+      )}
 
       {/* Image */}
       <div style={{ background: 'var(--surface2)', position: 'relative', flexShrink: 0 }}>
@@ -177,9 +213,27 @@ function CardTile({ card, tick }: { card: CardEvent; tick: number }) {
             ['Spawn ID', <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{card.spawn_id}</span>],
             card.issue !== null ? ['Issue', `#${card.issue}`] : null,
             ['Spawned', relativeTime(card.created_at)],
+            ['Group', groupName],
+            // ── Decision ───────────────────────────────────────
+            card.decision_should_claim !== null ? [
+              'Decision',
+              <span style={{ color: card.decision_should_claim ? 'var(--green)' : 'var(--muted)' }}>
+                {card.decision_should_claim ? 'Claim' : 'Skip'}
+                {card.decision_delay_ms !== null && card.decision_should_claim
+                  ? <span style={{ color: 'var(--muted)', marginLeft: 6 }}>{card.decision_delay_ms}ms</span>
+                  : null}
+              </span>,
+            ] : null,
+            card.decision_reason ? ['Reason', <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>{card.decision_reason}</span>] : null,
+            // ── Claim outcome ──────────────────────────────────
+            card.claimed && card.claim_source ? [
+              'Source',
+              <span style={{ color: card.claim_source === 'bot' ? 'var(--blue)' : 'var(--green)' }}>
+                {card.claim_source === 'bot' ? 'Bot' : 'Other'}
+              </span>,
+            ] : null,
             card.claimed && card.claimer_jid ? ['Claimer', `+${getNumber(card.claimer_jid)}`] : null,
             card.claimed && card.claimed_at  ? ['Claimed at', relativeTime(card.claimed_at)]  : null,
-            ['Group', <span style={{ fontFamily: 'monospace', fontSize: 10, wordBreak: 'break-all' }}>{card.group_id}</span>],
           ] as ([string, React.ReactNode] | null)[])
             .filter((r): r is [string, React.ReactNode] => r !== null)
             .map(([label, value]) => (
@@ -202,6 +256,7 @@ export default function CardsPage() {
   const [filter, setFilter] = useState<Filter>('all');
   const [sort,   setSort]   = useState<Sort>('newest');
   const [tick,   setTick]   = useState(0);
+  const groupName = useGroupNames();
 
   useEffect(() => {
     void (async () => {
@@ -330,7 +385,9 @@ export default function CardsPage() {
           gap: 16,
         }}>
           {displayed.map(card => (
-            <CardTile key={card.id} card={card} tick={tick} />
+            <CardTile key={card.id} card={card} tick={tick}
+              groupName={groupName(card.group_id)}
+              onDelete={id => setCards(prev => prev.filter(c => c.id !== id))} />
           ))}
         </div>
       )}
