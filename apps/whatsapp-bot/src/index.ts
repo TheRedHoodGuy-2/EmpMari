@@ -111,14 +111,41 @@ const BOT_NAMES = new Set([
 const claimInFlight   = new Set<string>(); // groupJid → claim in progress
 const claimCancelled  = new Set<string>(); // groupJid → abort signal for in-flight claim
 const attemptedSpawns = new Set<string>(); // spawnId  → already attempted, never retry
+const pendingClaims = new Map<string, string>(); // cardName → spawnId (our in-flight claims)
+let   lastBotSendAt = 0; // epoch ms of last bot message send — used for inactivity check
 
-// ── High-tier always-claim brackets (T4/5/6/S bypass humaniser) ──
+// ── High-tier always-claim (T4/5/6/S bypass humaniser) ──────────
 const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
-const CLAIM_BRACKETS = [
-  { minMs: 1400, maxMs: 1800 }, // fast bracket
-  { minMs: 1600, maxMs: 2000 }, // mid bracket
-  { minMs: 1800, maxMs: 2200 }, // slow bracket
-];
+
+// ── 3-range delay system ─────────────────────────────────────────
+// Range A (fast) : 1.15–2.86s  — HIGH_TIERS always, day+active eligible
+// Range B (medium): 1.60–3.20s — eligible any time
+// Range C (slow)  : 1.90–4.00s — night or inactive eligible
+const DELAY_A: [number, number] = [1450, 2860];
+const DELAY_B: [number, number] = [2670, 3260];
+const DELAY_C: [number, number] = [1990, 4770];
+
+function pickDelayMs(isHighTier: boolean): number {
+  if (isHighTier) {
+    return Math.round(DELAY_A[0] + Math.random() * (DELAY_A[1] - DELAY_A[0]));
+  }
+  const hourUTC  = new Date().getUTCHours();
+  const isNight  = hourUTC < 8 || hourUTC >= 22;
+  const inactive = lastBotSendAt === 0 || (Date.now() - lastBotSendAt) > 10 * 60_000;
+
+  let range: [number, number];
+  if (!isNight && !inactive) {
+    // Day + active → pick A or B
+    range = Math.random() < 0.5 ? DELAY_A : DELAY_B;
+  } else if (isNight && inactive) {
+    // Night + inactive → mostly C, occasionally B
+    range = Math.random() < 0.3 ? DELAY_B : DELAY_C;
+  } else {
+    // Night OR inactive → B or C
+    range = Math.random() < 0.5 ? DELAY_B : DELAY_C;
+  }
+  return Math.round(range[0] + Math.random() * (range[1] - range[0]));
+}
 
 // ── Activity log + humaniser ──────────────────────────────────
 const activityLog = createActivityLog(db);
@@ -208,9 +235,12 @@ async function connectToWhatsApp(): Promise<void> {
   });
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return;
     for (const msg of messages) {
       if (!msg.message) continue;
+      // Process 'notify' (all incoming) + 'append' only for our own sent messages
+      // ('append' is how Baileys echoes sock.sendMessage() back to us)
+      const isOwnAppend = type === 'append' && msg.key.fromMe === true;
+      if (type !== 'notify' && !isOwnAppend) continue;
       handleMessage(msg, sock, classifier, claimer, typingSim, selfNumber, resolveJid).catch(err => {
         console.error('[MSG] Error:', (err as Error).message);
       });
@@ -229,6 +259,7 @@ async function handleMessage(
   resolveJid:  (jid: string) => Promise<string>,
 ): Promise<void> {
 
+  if (!msg.key) return;
   const messageId = msg.key.id ?? null;
 
   if (messageId) {
@@ -358,7 +389,18 @@ async function handleMessage(
     }
     claimInFlight.add(targetGroup);
 
-    // ── Claim flow: pause → type → decide → fire → retry ─────
+    // ── Decision — computed here so both IIFEs share the same values ─────
+    const tier = String(f.tier);
+    const activityScore = (await activityLog.getScore(targetGroup)).score;
+    const isHighTier = HIGH_TIERS.has(tier);
+    const delayMs = pickDelayMs(isHighTier);
+    const decision = isHighTier
+      ? { shouldClaim: true, delayMs, reason: `T${tier} always claim`, claimChance: 100, configUsed: 'high-tier' }
+      : { ...(await humaniser.decide({ tier, design: 'unknown', issue: f.issue, activityScore })), delayMs };
+
+    console.log(`[CARD] ${f.cardName} (${f.spawnId}) T${tier} #${f.issue} — ${decision.shouldClaim ? 'CLAIMING' : 'SKIPPING'} | delay=${(delayMs/1000).toFixed(2)}s | ${decision.reason}`);
+
+    // ── Claim flow: pause → type → fire → retry ─────────────────
     void (async () => {
       // Bot registration gate — test GC bypasses, real GCs require known_bots (JID check)
       const isTestGc = groupJid !== null && groupJid === testGcJid;
@@ -383,33 +425,6 @@ async function handleMessage(
           return;
         }
       }
-
-      const tier = String(f.tier);
-
-      // 1. Decide immediately — during the invisible pre-typing pause
-      const activityScore = (await activityLog.getScore(targetGroup)).score;
-
-      let decision: { shouldClaim: boolean; reason: string; delayMs: number };
-
-      if (HIGH_TIERS.has(tier)) {
-        // High-tier: always claim, bypass humaniser DB config
-        const bracket = CLAIM_BRACKETS[Math.floor(Math.random() * CLAIM_BRACKETS.length)]!;
-        const delayMs = bracket.minMs + Math.floor(Math.random() * (bracket.maxMs - bracket.minMs));
-        decision = { shouldClaim: true, reason: `T${tier} — always claim`, delayMs };
-      } else {
-        decision = await humaniser.decide({
-          tier, design: 'unknown', issue: f.issue, activityScore,
-        });
-      }
-
-      console.log(`[CARD] ${f.cardName} (${f.spawnId}) T${tier} #${f.issue} — ${decision.shouldClaim ? 'CLAIMING' : 'SKIPPING'} | ${decision.reason}`);
-
-      // Store decision in card_events (fire-and-forget)
-      void db.from('card_events').update({
-        decision_should_claim: decision.shouldClaim,
-        decision_reason:       decision.reason,
-        decision_delay_ms:     decision.delayMs,
-      }).eq('spawn_id', f.spawnId);
 
       // 2. If skipping — do nothing, no typing flash, no tell
       if (!decision.shouldClaim) {
@@ -442,6 +457,8 @@ async function handleMessage(
       attemptedSpawns.add(f.spawnId);
 
       // 8. Fire — message first, stop typing after (no gap)
+      pendingClaims.set(f.cardName, f.spawnId);
+      lastBotSendAt = Date.now();
       await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
       typingSim.stopLoop(targetGroup);
       claimInFlight.delete(targetGroup); // release group — new spawns can be claimed now
@@ -450,8 +467,6 @@ async function handleMessage(
       // 9. ntfy push notification
       const ntfyTopic = process.env['NTFY_TOPIC'];
       if (ntfyTopic) {
-        const tierNum    = parseInt(tier);
-        const isHighTier = tier === 'S' || tierNum >= 4;
         fetch(`https://ntfy.sh/${ntfyTopic}`, {
           method: 'POST',
           headers: {
@@ -526,8 +541,17 @@ async function handleMessage(
         claimed:   false,
       }, { onConflict: 'spawn_id' });
 
-      if (cardError) console.error('[CARD_INSERT ERROR]', cardError.message);
-      else console.log(`[CARD] ${f.cardName} (${f.spawnId}) saved`);
+      if (cardError) {
+        console.error('[CARD_INSERT ERROR]', cardError.message);
+      } else {
+        console.log(`[CARD] ${f.cardName} (${f.spawnId}) saved`);
+        // Write decision now — row guaranteed to exist
+        void db.from('card_events').update({
+          decision_should_claim: decision.shouldClaim,
+          decision_reason:       decision.reason,
+          decision_delay_ms:     decision.delayMs,
+        }).eq('spawn_id', f.spawnId);
+      }
 
       void db.from('parse_log').insert({
         group_id:          groupJid,
@@ -683,9 +707,8 @@ async function handleMessage(
         let summary: string;
 
         if (HIGH_TIERS.has(tier)) {
-          const bracket = CLAIM_BRACKETS[Math.floor(Math.random() * CLAIM_BRACKETS.length)]!;
-          waitMs  = bracket.minMs + Math.random() * (bracket.maxMs - bracket.minMs);
-          summary = `T${tier} — always claim | delay ${Math.round(waitMs / 1000)}s`;
+          waitMs  = pickDelayMs(true);
+          summary = `T${tier} — always claim | delay ${(waitMs / 1000).toFixed(2)}s`;
         } else {
           const score    = await activityLog.getScore(groupJid);
           const decision = await humaniser.decide({ tier, design, issue, activityScore: score.score });
@@ -822,17 +845,27 @@ async function handleMessage(
     }
 
     if (!spawnId) {
-      const cardName = (trace.result.fields as { cardName?: string } | undefined)?.cardName ?? null;
+      // L0 of CLAIM_SUCCESS captures the name with WhatsApp bold markers (*name*)
+      // Strip them before lookup — normalizer only handles math-unicode, not markdown
+      const rawCardName = (trace.result.fields as { cardName?: string } | undefined)?.cardName ?? null;
+      const cardName    = rawCardName?.replace(/\*/g, '') ?? null;
       if (cardName) {
-        const { data: cardRow } = await db
-          .from('card_events')
-          .select('spawn_id')
-          .eq('card_name', cardName)
-          .eq('claimed', false)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        spawnId = cardRow?.spawn_id ?? null;
+        // Check in-memory map first (avoids DB race — card might not be inserted yet)
+        if (pendingClaims.has(cardName)) {
+          spawnId = pendingClaims.get(cardName)!;
+          pendingClaims.delete(cardName);
+          claimerJid = selfNumber + '@s.whatsapp.net';
+        } else {
+          const { data: cardRow } = await db
+            .from('card_events')
+            .select('spawn_id')
+            .eq('card_name', cardName)
+            .eq('claimed', false)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          spawnId = cardRow?.spawn_id ?? null;
+        }
       }
     }
 
