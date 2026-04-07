@@ -112,40 +112,21 @@ const claimInFlight   = new Set<string>(); // groupJid → claim in progress
 const claimCancelled  = new Set<string>(); // groupJid → abort signal for in-flight claim
 const attemptedSpawns = new Set<string>(); // spawnId  → already attempted, never retry
 const pendingClaims = new Map<string, string>(); // cardName → spawnId (our in-flight claims)
-let   lastBotSendAt = 0; // epoch ms of last bot message send — used for inactivity check
 
 // ── High-tier always-claim (T4/5/6/S bypass humaniser) ──────────
 const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
 
-// ── 3-range delay system ─────────────────────────────────────────
-// Range A (fast) : 1.15–2.86s  — HIGH_TIERS always, day+active eligible
-// Range B (medium): 1.60–3.20s — eligible any time
-// Range C (slow)  : 1.90–4.00s — night or inactive eligible
-const DELAY_S: [number, number] = [200,  800];  // T4+ typing duration (pre-pause 300–600ms → total 500–1400ms)
-const DELAY_A: [number, number] = [1450, 2860];
-const DELAY_B: [number, number] = [2670, 3260];
-const DELAY_C: [number, number] = [1990, 4770];
-
-function pickDelayMs(isHighTier: boolean): number {
-  if (isHighTier) {
-    return Math.round(DELAY_S[0] + Math.random() * (DELAY_S[1] - DELAY_S[0]));
-  }
-  const hourUTC  = new Date().getUTCHours();
-  const isNight  = hourUTC < 8 || hourUTC >= 22;
-  const inactive = lastBotSendAt === 0 || (Date.now() - lastBotSendAt) > 10 * 60_000;
-
-  let range: [number, number];
-  if (!isNight && !inactive) {
-    // Day + active → pick A or B
-    range = Math.random() < 0.5 ? DELAY_A : DELAY_B;
-  } else if (isNight && inactive) {
-    // Night + inactive → mostly C, occasionally B
-    range = Math.random() < 0.3 ? DELAY_B : DELAY_C;
-  } else {
-    // Night OR inactive → B or C
-    range = Math.random() < 0.5 ? DELAY_B : DELAY_C;
-  }
-  return Math.round(range[0] + Math.random() * (range[1] - range[0]));
+// ── Delay system ─────────────────────────────────────────────────
+// Total time from spawn to claim: 2–7s (human-feeling)
+// Pre-pause (before typing): 1–3s
+// Typing duration: remainder to hit total
+// High tiers use the same ranges — everyone looks the same
+function pickDelayMs(): number {
+  // Typing duration: total claim time minus pre-pause, floored at 500ms
+  // Pre-pause is picked separately in the claim flow
+  // Here we return the typing portion: 500ms–4000ms
+  // (pre-pause 1000–3000ms + typing 500–4000ms → total 1.5–7s, typically 2–6s)
+  return Math.round(500 + Math.pow(Math.random(), 0.7) * 3500);
 }
 
 // ── Activity log + humaniser ──────────────────────────────────
@@ -394,7 +375,7 @@ async function handleMessage(
     const tier = String(f.tier);
     const activityScore = (await activityLog.getScore(targetGroup)).score;
     const isHighTier = HIGH_TIERS.has(tier);
-    const delayMs = pickDelayMs(isHighTier);
+    const delayMs = pickDelayMs();
     const decision = isHighTier
       ? { shouldClaim: true, delayMs, reason: `T${tier} always claim`, claimChance: 100, configUsed: 'high-tier' }
       : { ...(await humaniser.decide({ tier, design: 'unknown', issue: f.issue, activityScore })), delayMs };
@@ -436,10 +417,8 @@ async function handleMessage(
         return;
       }
 
-      // 3. Pre-typing pause — 200–500ms for high tier, 600–1200ms otherwise
-      const prePause = isHighTier
-        ? 300 + Math.random() * 300
-        : 600 + Math.pow(Math.random(), 2) * 600;
+      // 3. Pre-typing pause — 1–3s (human reaction time before starting to type)
+      const prePause = 1000 + Math.random() * 2000;
       await new Promise<void>(r => setTimeout(r, prePause));
 
       // 4. Typing starts — stays on until we fire
@@ -448,7 +427,7 @@ async function handleMessage(
 
       // 5. Wait remainder of humaniser delay (subtract time already elapsed)
       const elapsed  = Date.now() - typingStartedAt;
-      const remainMs = Math.max(isHighTier ? 50 : 300, decision.delayMs - elapsed);
+      const remainMs = Math.max(300, decision.delayMs - elapsed);
       await new Promise<void>(r => setTimeout(r, remainMs));
 
       // 6. Check if someone else claimed while we were waiting
@@ -465,7 +444,6 @@ async function handleMessage(
 
       // 8. Fire — message first, stop typing after (no gap)
       pendingClaims.set(f.cardName, f.spawnId);
-      lastBotSendAt = Date.now();
       await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
       typingSim.stopLoop(targetGroup);
       // Keep claimInFlight alive — used as confirmation flag for retry logic below

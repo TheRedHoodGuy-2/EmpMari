@@ -234,10 +234,10 @@ function CardTile({ card, tick, onDelete, groupName }: { card: CardEvent; tick: 
             ] : null,
             card.claimed && card.claimer_jid ? ['Claimer', `+${getNumber(card.claimer_jid)}`] : null,
             card.claimed && card.claimed_at  ? ['Claimed at', relativeTime(card.claimed_at)]  : null,
-            card.claimed && card.claimed_at && (() => {
+            card.claimed && card.claimed_at ? (() => {
               const diff = (new Date(card.claimed_at).getTime() - new Date(card.created_at).getTime()) / 1000;
               return diff > 0 ? ['Spawn → claim', <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{diff.toFixed(1)}s</span>] as [string, React.ReactNode] : null;
-            })(),
+            })() : null,
           ] as ([string, React.ReactNode] | null)[])
             .filter((r): r is [string, React.ReactNode] => r !== null)
             .map(([label, value]) => (
