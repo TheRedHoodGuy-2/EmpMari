@@ -2,6 +2,7 @@ import type { NextConfig } from 'next';
 
 const config: NextConfig = {
   transpilePackages: ['@mariabelle/parser', '@mariabelle/identifier'],
+  serverExternalPackages: ['tesseract.js'],
   webpack: (config) => {
     // The parser package uses `.js` extensions on its TypeScript imports
     // (required for Node/tsx). Webpack can't resolve `.js` → `.ts` on its

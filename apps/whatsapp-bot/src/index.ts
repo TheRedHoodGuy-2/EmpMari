@@ -12,6 +12,7 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
   type WASocket,
+  type WAMessage,
   type proto,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
@@ -35,7 +36,6 @@ import { initClaimer }       from './claimer.js';
 import { createCleaner }     from './cleaner.js';
 import { createActivityLog } from '@mariabelle/activity-log';
 import { detectCard }        from '@mariabelle/card-detector';
-import Jimp                  from 'jimp';
 
 const __dirname  = fileURLToPath(new URL('.', import.meta.url));
 const AUTH_DIR   = resolve(__dirname, '../auth');
@@ -121,13 +121,14 @@ const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
 // Range A (fast) : 1.15–2.86s  — HIGH_TIERS always, day+active eligible
 // Range B (medium): 1.60–3.20s — eligible any time
 // Range C (slow)  : 1.90–4.00s — night or inactive eligible
+const DELAY_S: [number, number] = [200,  800];  // T4+ typing duration (pre-pause 300–600ms → total 500–1400ms)
 const DELAY_A: [number, number] = [1450, 2860];
 const DELAY_B: [number, number] = [2670, 3260];
 const DELAY_C: [number, number] = [1990, 4770];
 
 function pickDelayMs(isHighTier: boolean): number {
   if (isHighTier) {
-    return Math.round(DELAY_A[0] + Math.random() * (DELAY_A[1] - DELAY_A[0]));
+    return Math.round(DELAY_S[0] + Math.random() * (DELAY_S[1] - DELAY_S[0]));
   }
   const hourUTC  = new Date().getUTCHours();
   const isNight  = hourUTC < 8 || hourUTC >= 22;
@@ -241,7 +242,7 @@ async function connectToWhatsApp(): Promise<void> {
       // ('append' is how Baileys echoes sock.sendMessage() back to us)
       const isOwnAppend = type === 'append' && msg.key.fromMe === true;
       if (type !== 'notify' && !isOwnAppend) continue;
-      handleMessage(msg, sock, classifier, claimer, typingSim, selfNumber, resolveJid).catch(err => {
+      handleMessage(msg, sock, classifier, claimer, cleaner, typingSim, selfNumber, resolveJid).catch(err => {
         console.error('[MSG] Error:', (err as Error).message);
       });
     }
@@ -254,6 +255,7 @@ async function handleMessage(
   sock:        WASocket,
   classifier:  ReturnType<typeof createClassifier>,
   claimer:     ReturnType<typeof initClaimer>,
+  cleaner:     ReturnType<typeof createCleaner>,
   typingSim:   TypingSimulator,
   selfNumber:  string,
   resolveJid:  (jid: string) => Promise<string>,
@@ -315,18 +317,17 @@ async function handleMessage(
   if (hasImage && groupJid && groupJid === testGcJid) {
     void (async () => {
       try {
-        const buffer = await downloadMediaMessage(msg, 'buffer', {});
+        const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
         const result = await detectCard(buffer as Buffer);
         const gen  = result.generation === 'new' ? '🆕 NEW' : result.generation === 'old' ? '🕰️ OLD' : '❓ UNKNOWN';
         const conf = result.confidence === 'high' ? '🟢' : result.confidence === 'medium' ? '🟡' : '🔴';
         const s    = result.signals;
-        const corner = (v: number) => v < 400 ? '🟢' : '🔴';
         await sock.sendMessage(groupJid, {
           text:
             `${gen} ${conf} ${result.confidence}\n` +
-            `Uniform corners: ${s.uniformCorners}/4\n` +
-            `${corner(s.cornerVarianceTL)}TL:${s.cornerVarianceTL} ${corner(s.cornerVarianceTR)}TR:${s.cornerVarianceTR}\n` +
-            `${corner(s.cornerVarianceBL)}BL:${s.cornerVarianceBL} ${corner(s.cornerVarianceBR)}BR:${s.cornerVarianceBR}\n` +
+            `Spread: ${s.cornerSpread}px | Variance: ${s.cornerVariance}px\n` +
+            `TL:${s.cornerDepthTopLeft} TR:${s.cornerDepthTopRight} BL:${s.cornerDepthBottomLeft} BR:${s.cornerDepthBottomRight}\n` +
+            `INFO: ${s.infoSide} (${s.ocrText || 'no text'})\n` +
             `${result.timingMs}ms`,
         });
       } catch (e) {
@@ -402,13 +403,16 @@ async function handleMessage(
 
     // ── Claim flow: pause → type → fire → retry ─────────────────
     void (async () => {
-      // Bot registration gate — test GC bypasses, real GCs require known_bots (JID check)
+      // Bot registration gate — test GC bypasses, real GCs require known_bots (JID or LID check)
       const isTestGc = groupJid !== null && groupJid === testGcJid;
       if (!isTestGc) {
+        // Try both the resolved JID and the raw LID — whichever is stored in known_bots
+        const jidsToCheck = [normalizeJid(senderJid)];
+        if (rawLid) jidsToCheck.push(rawLid);
         const { data: botRow } = await db
           .from('known_bots')
           .select('jid')
-          .eq('jid', normalizeJid(senderJid))
+          .in('jid', jidsToCheck)
           .maybeSingle();
         if (!botRow) {
           // If name matches known bot list, auto-register for next time but skip this claim
@@ -419,7 +423,7 @@ async function handleMessage(
             );
             console.log(`[BOT AUTO-REG] "${msg.pushName}" registered as unverified — skipping this claim`);
           } else {
-            console.log(`[CARD] ${f.spawnId} — unregistered sender "${msg.pushName ?? senderJid}" — skipping claim`);
+            console.log(`[CARD] ${f.spawnId} — unregistered sender "${msg.pushName ?? senderJid}" (jid=${normalizeJid(senderJid)}, lid=${rawLid ?? 'none'}) — skipping claim`);
           }
           claimInFlight.delete(targetGroup);
           return;
@@ -432,8 +436,11 @@ async function handleMessage(
         return;
       }
 
-      // 3. 600–1200ms pause before typing — biased toward shorter end
-      await new Promise<void>(r => setTimeout(r, 600 + Math.pow(Math.random(), 2) * 600));
+      // 3. Pre-typing pause — 200–500ms for high tier, 600–1200ms otherwise
+      const prePause = isHighTier
+        ? 300 + Math.random() * 300
+        : 600 + Math.pow(Math.random(), 2) * 600;
+      await new Promise<void>(r => setTimeout(r, prePause));
 
       // 4. Typing starts — stays on until we fire
       typingSim.startLoop(targetGroup);
@@ -441,7 +448,7 @@ async function handleMessage(
 
       // 5. Wait remainder of humaniser delay (subtract time already elapsed)
       const elapsed  = Date.now() - typingStartedAt;
-      const remainMs = Math.max(300, decision.delayMs - elapsed);
+      const remainMs = Math.max(isHighTier ? 50 : 300, decision.delayMs - elapsed);
       await new Promise<void>(r => setTimeout(r, remainMs));
 
       // 6. Check if someone else claimed while we were waiting
@@ -461,7 +468,7 @@ async function handleMessage(
       lastBotSendAt = Date.now();
       await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
       typingSim.stopLoop(targetGroup);
-      claimInFlight.delete(targetGroup); // release group — new spawns can be claimed now
+      // Keep claimInFlight alive — used as confirmation flag for retry logic below
       console.log(`[CLAIMER] .claim ${f.spawnId} sent`);
 
       // 9. ntfy push notification
@@ -481,13 +488,14 @@ async function handleMessage(
       }
 
       // 10. Wait for confirmation — retry ONCE after 35–50s only if no reply came
+      // claimInFlight is cleared by CLAIM_SUCCESS/CLAIM_TAKEN handlers — that is our signal
       const retryAfterMs = 35000 + Math.random() * 15000;
       await new Promise<void>(r => setTimeout(r, retryAfterMs));
 
-      // If CLAIM_SUCCESS or CLAIM_TAKEN arrived during the wait — skip retry
-      if (claimCancelled.has(targetGroup) || !claimInFlight.has(targetGroup)) {
+      // If CLAIM_SUCCESS or CLAIM_TAKEN arrived during the wait — they cleared claimInFlight
+      if (!claimInFlight.has(targetGroup) || claimCancelled.has(targetGroup)) {
         claimCancelled.delete(targetGroup);
-        claimInFlight.delete(targetGroup);
+        console.log(`[CLAIMER] ${f.spawnId} confirmed during wait — no retry needed`);
         return;
       }
 
@@ -514,7 +522,7 @@ async function handleMessage(
 
       if (hasImage) {
         try {
-          const buffer = await downloadMediaMessage(msg, 'buffer', {});
+          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
           const stored = await imager.store({
             spawnId:     f.spawnId,
             groupId:     targetGroup,
@@ -637,45 +645,12 @@ async function handleMessage(
     if (cmd === '.start' && testGcJid === null) {
       testGcJid = groupJid;
       const name = groupNameCache.get(groupJid)?.name ?? groupJid;
-      await activityLog.record({ groupId: groupJid, messageId: messageId ?? undefined });
+      await activityLog.record({ groupId: groupJid, messageId: messageId ?? null });
       const score = await activityLog.getScore(groupJid);
       await sock.sendMessage(groupJid, { text: `✅ Test GC registered: ${name}\nActivity score: ${score.score} (${score.messageCount}/4 msgs)` });
       return;
     }
 
-    // .image — DISABLED (image detection paused)
-    if (false && cmd === '.image' && groupJid === testGcJid) {
-      console.log(`[IMAGE-TEST] .image received | hasImage: ${hasImage}`);
-      if (!hasImage) {
-        await sock.sendMessage(groupJid, { text: '❌ No image attached — send image with caption .image' });
-        return;
-      }
-      try {
-        console.log('[IMAGE-TEST] Downloading...');
-        const rawBuffer = await downloadMediaMessage(msg, 'buffer', {});
-        console.log(`[IMAGE-TEST] Downloaded ${(rawBuffer as Buffer).length} bytes — converting to PNG`);
-        // WhatsApp recompresses images to JPEG, stripping alpha. Re-encode as PNG so detectCard sees alpha.
-        const img       = await Jimp.read(rawBuffer as Buffer);
-        const pngBuffer = await img.getBufferAsync(Jimp.MIME_PNG);
-        console.log(`[IMAGE-TEST] PNG buffer: ${pngBuffer.length} bytes`);
-        const result    = await detectCard(pngBuffer);
-        console.log(`[IMAGE-TEST] Detection done: ${result.generation} ${result.confidence}`);
-        const gen = result.generation === 'new' ? '🆕 NEW' : result.generation === 'old' ? '🕰️ OLD' : '❓ UNKNOWN';
-        const conf = result.confidence === 'high' ? '🟢' : result.confidence === 'medium' ? '🟡' : '🔴';
-        const s = result.signals;
-        await sock.sendMessage(groupJid, {
-          text:
-            `${gen} ${conf} ${result.confidence}\n` +
-            `Spread: ${s.cornerSpread}px | Avg: ${s.avgCornerDepth.toFixed(1)}px\n` +
-            `TL:${s.cornerDepthTopLeft} TR:${s.cornerDepthTopRight} BL:${s.cornerDepthBottomLeft} BR:${s.cornerDepthBottomRight}\n` +
-            `fmt:${s.format} alpha:${s.hasAlphaChannel} | ${result.timingMs}ms`,
-        });
-      } catch (e) {
-        console.error('[IMAGE-TEST] Error:', (e as Error).message);
-        await sock.sendMessage(groupJid, { text: `❌ Failed: ${(e as Error).message}` });
-      }
-      return;
-    }
 
     // .score — print current activity score for test GC
     if (cmd === '.score' && groupJid === testGcJid) {
@@ -781,7 +756,7 @@ async function handleMessage(
         message: inner,
       } as typeof msg;
 
-      const buffer = await downloadMediaMessage(fakeMsg, 'buffer', {});
+      const buffer = await downloadMediaMessage(fakeMsg as WAMessage, 'buffer', {});
       const selfJid = `${selfNumber}@s.whatsapp.net`;
 
       if (inner.imageMessage) {
@@ -812,7 +787,7 @@ async function handleMessage(
 
   // ── Record activity for every self message in test GC ─────
   if (senderType === 'self' && groupJid && groupJid === testGcJid) {
-    await activityLog.record({ groupId: groupJid, messageId: messageId ?? undefined });
+    await activityLog.record({ groupId: groupJid, messageId: messageId ?? null });
     const score = await activityLog.getScore(groupJid);
     console.log(`[ACTIVITY-TEST] Recorded self message. Score: ${score.score} (${score.messageCount} msgs in last 60min)`);
   }

@@ -8,6 +8,7 @@
     "start": "next start"
   },
   "dependencies": {
+    "@mariabelle/card-detector": "file:../../packages/card-detector",
     "@mariabelle/identifier": "file:../../packages/identifier",
     "@mariabelle/parser": "file:../../packages/parser",
     "@supabase/ssr": "^0.9.0",
@@ -16,7 +17,7 @@
     "next": "15.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "@mariabelle/card-detector": "file:../../packages/card-detector"
+    "tesseract.js": "^5.1.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

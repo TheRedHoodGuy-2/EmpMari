@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 import type { DetectionResult } from '@mariabelle/card-detector';
 
 // ── Styles ────────────────────────────────────────────────────
@@ -156,6 +156,9 @@ function ResultPanel({ result }: { result: DetectionResult }) {
             <SignalRow label="Corner variance (σ)"         raw={`${s.cornerVariance}px`}         interpretation="Std deviation of 4 corner depths" />
             <SignalRow label="Image format"                raw={s.format ?? 'unknown'}           interpretation={s.hasAlphaChannel ? 'PNG — alpha scan valid' : 'JPEG — no alpha, depths unreliable'} />
             <SignalRow label="Dimensions"                  raw={`${s.width}×${s.height}`}        interpretation="—" />
+            <SignalRow label="INFO found"    raw={s.infoFound ? 'true' : 'false'} interpretation={s.infoFound ? 'OCR found "INFO" in a bottom quadrant' : 'INFO not found in either bottom quadrant'} />
+            <SignalRow label="INFO quadrant" raw={s.infoSide === 'right' ? 'Bottom-right (new)' : s.infoSide === 'left' ? 'Bottom-left (old)' : '—'} interpretation={s.infoSide === 'right' ? 'New card — INFO rotated 90°' : s.infoSide === 'left' ? 'Old card — INFO upright' : 'Not detected'} />
+            <SignalRow label="OCR text"      raw={s.ocrText || '—'} interpretation="Raw tesseract output from the quadrant crop" />
           </tbody>
         </table>
       </div>
@@ -198,6 +201,137 @@ function ResultPanel({ result }: { result: DetectionResult }) {
         )}
       </div>
     </div>
+  );
+}
+
+// ── Scan overlay ─────────────────────────────────────────────
+
+function ScanOverlay({ src, result }: { src: string; result: DetectionResult | null }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [imgSize, setImgSize] = useState<{ w: number; h: number } | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const img = new Image();
+    img.src = src;
+    img.onload = () => {
+      canvas.width  = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      setImgSize({ w: img.naturalWidth, h: img.naturalHeight });
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+
+      if (!result) return;
+
+      const W = canvas.width;
+      const H = canvas.height;
+      const half = Math.floor(W / 2);
+      const s = result.signals;
+      const fs = Math.max(11, Math.round(H * 0.028));
+
+      // ── Scan strips ───────────────────────────────────────────
+      // Strip 1 — left:  x=0,   y=0, w=25%, h=full
+      // Strip 2 — right: x=75%, y=0, w=25%, h=full
+      const lx = 0,                    ly = 0, lw = Math.floor(W * 0.25), lh = H;
+      const rx = Math.floor(W * 0.75), ry = 0, rw = Math.floor(W * 0.25), rh = H;
+
+      const leftActive  = s.infoSide === 'left';
+      const rightActive = s.infoSide === 'right';
+
+      ctx.font = `${fs}px monospace`;
+      ctx.textAlign = 'center';
+
+      // Left strip
+      ctx.fillStyle = leftActive ? 'rgba(74,222,128,0.25)' : 'rgba(255,255,255,0.06)';
+      ctx.fillRect(lx, ly, lw, lh);
+      ctx.strokeStyle = leftActive ? '#4ade80' : 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 4]);
+      ctx.strokeRect(lx + 1, ly + 1, lw - 2, lh - 2);
+      ctx.setLineDash([]);
+      ctx.fillStyle = leftActive ? '#4ade80' : 'rgba(255,255,255,0.35)';
+      ctx.fillText('LEFT', lx + lw / 2, ly + lh / 2 + fs / 3);
+
+      // Right strip
+      ctx.fillStyle = rightActive ? 'rgba(99,102,241,0.25)' : 'rgba(255,255,255,0.06)';
+      ctx.fillRect(rx, ry, rw, rh);
+      ctx.strokeStyle = rightActive ? '#818cf8' : 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 4]);
+      ctx.strokeRect(rx + 1, ry + 1, rw - 2, rh - 2);
+      ctx.setLineDash([]);
+      ctx.fillStyle = rightActive ? '#818cf8' : 'rgba(255,255,255,0.35)';
+      ctx.fillText('RIGHT', rx + rw / 2, ry + rh / 2 + fs / 3);
+
+      // ── INFO result label ──────────────────────────────────
+      if (s.infoFound) {
+        const isLeft    = s.infoSide === 'left';
+        const labelColor = isLeft ? '#4ade80' : '#818cf8';
+        const labelX     = isLeft ? half / 2 : half + (W - half) / 2;
+        ctx.font = `bold ${fs + 2}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = labelColor;
+        ctx.fillText(`INFO ✓`, labelX, H - 36);
+        ctx.font = `${Math.max(10, fs - 2)}px monospace`;
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.fillText(`"${s.ocrText}"`, labelX, H - 16);
+      } else {
+        ctx.font = `bold ${fs}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(248,113,113,0.8)';
+        ctx.fillText('INFO not found in either quadrant', W / 2, H - 20);
+      }
+
+      // ── Divider ────────────────────────────────────────────
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([8, 6]);
+      ctx.beginPath();
+      ctx.moveTo(half, 0);
+      ctx.lineTo(half, H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // ── Corner depth markers ───────────────────────────────
+      const corners = [
+        { x: 0, y: 0, dx:  s.cornerDepthTopLeft,      label: `TL:${s.cornerDepthTopLeft}` },
+        { x: W, y: 0, dx: -s.cornerDepthTopRight,      label: `TR:${s.cornerDepthTopRight}` },
+        { x: 0, y: H, dx:  s.cornerDepthBottomLeft,    label: `BL:${s.cornerDepthBottomLeft}` },
+        { x: W, y: H, dx: -s.cornerDepthBottomRight,   label: `BR:${s.cornerDepthBottomRight}` },
+      ];
+      corners.forEach(({ x, y, dx, label }) => {
+        const depth = Math.abs(dx);
+        const col = depth > 25 ? '#4ade80' : '#9ca3af';
+        ctx.fillStyle = col;
+        ctx.beginPath();
+        ctx.arc(x + dx, y + (y === 0 ? depth : -depth), 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.font = `bold ${Math.max(10, Math.round(H * 0.022))}px monospace`;
+        ctx.fillStyle = col;
+        ctx.textAlign = x === 0 ? 'left' : 'right';
+        const lx = x === 0 ? x + depth + 8 : x - depth - 8;
+        const ly = y === 0 ? depth + 24 : y - depth - 8;
+        ctx.fillText(label, lx, ly);
+      });
+    };
+  }, [src, result]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{
+        width: '100%',
+        display: 'block',
+        borderRadius: 10,
+        imageRendering: 'auto',
+      }}
+      title={imgSize ? `${imgSize.w}×${imgSize.h}` : ''}
+    />
   );
 }
 
@@ -281,7 +415,7 @@ export default function CardDetectorPage() {
             }}
           >
             {preview ? (
-              <img src={preview} alt="preview" style={{ width: '100%', display: 'block', borderRadius: 10 }} />
+              <ScanOverlay src={preview} result={result} />
             ) : (
               <>
                 <div style={{ fontSize: 32 }}>🖼️</div>

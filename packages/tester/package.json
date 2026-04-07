@@ -1,0 +1,21 @@
+{
+  "name": "@mariabelle/tester",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "peerDependencies": {
+    "@supabase/supabase-js":   "^2",
+    "@whiskeysockets/baileys": ">=6",
+    "@mariabelle/personality": "workspace:*",
+    "@mariabelle/humaniser":   "workspace:*",
+    "@mariabelle/parser":      "workspace:*",
+    "@mariabelle/activity-log":"workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
