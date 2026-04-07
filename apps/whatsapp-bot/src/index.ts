@@ -117,16 +117,22 @@ const pendingClaims = new Map<string, string>(); // cardName → spawnId (our in
 const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
 
 // ── Delay system ─────────────────────────────────────────────────
-// Total time from spawn to claim: 2–7s (human-feeling)
-// Pre-pause (before typing): 1–3s
-// Typing duration: remainder to hit total
-// High tiers use the same ranges — everyone looks the same
-function pickDelayMs(): number {
-  // Typing duration: total claim time minus pre-pause, floored at 500ms
-  // Pre-pause is picked separately in the claim flow
-  // Here we return the typing portion: 500ms–4000ms
-  // (pre-pause 1000–3000ms + typing 500–4000ms → total 1.5–7s, typically 2–6s)
-  return Math.round(500 + Math.pow(Math.random(), 0.7) * 3500);
+// Range A (fast)  :  700–1000ms — T4/5/6/S always
+// Range B (medium): 1000–1300ms — day + active
+// Range C (slow)  : 1500–2000ms — night or inactive
+// Pre-typing pause: 500–1000ms for all tiers
+const DELAY_A: [number, number] = [ 700, 1000];
+const DELAY_B: [number, number] = [1000, 1300];
+const DELAY_C: [number, number] = [1500, 2000];
+
+function pickDelayMs(isHighTier: boolean): number {
+  if (isHighTier) {
+    return Math.round(DELAY_A[0] + Math.random() * (DELAY_A[1] - DELAY_A[0]));
+  }
+  const hourUTC  = new Date().getUTCHours();
+  const isNight  = hourUTC < 8 || hourUTC >= 22;
+  const range = isNight ? DELAY_C : (Math.random() < 0.5 ? DELAY_B : DELAY_C);
+  return Math.round(range[0] + Math.random() * (range[1] - range[0]));
 }
 
 // ── Activity log + humaniser ──────────────────────────────────
@@ -375,7 +381,7 @@ async function handleMessage(
     const tier = String(f.tier);
     const activityScore = (await activityLog.getScore(targetGroup)).score;
     const isHighTier = HIGH_TIERS.has(tier);
-    const delayMs = pickDelayMs();
+    const delayMs = pickDelayMs(isHighTier);
     const decision = isHighTier
       ? { shouldClaim: true, delayMs, reason: `T${tier} always claim`, claimChance: 100, configUsed: 'high-tier' }
       : { ...(await humaniser.decide({ tier, design: 'unknown', issue: f.issue, activityScore })), delayMs };
@@ -417,8 +423,8 @@ async function handleMessage(
         return;
       }
 
-      // 3. Pre-typing pause — 1–3s (human reaction time before starting to type)
-      const prePause = 1000 + Math.random() * 2000;
+      // 3. Pre-typing pause — 500–1000ms
+      const prePause = 500 + Math.random() * 500;
       await new Promise<void>(r => setTimeout(r, prePause));
 
       // 4. Typing starts — stays on until we fire
