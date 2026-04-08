@@ -108,10 +108,12 @@ const BOT_NAMES = new Set([
 ]);
 
 // ── Claim guards ─────────────────────────────────────────────
-const claimInFlight   = new Set<string>(); // groupJid → claim in progress
-const claimCancelled  = new Set<string>(); // groupJid → abort signal for in-flight claim
-const attemptedSpawns = new Set<string>(); // spawnId  → already attempted, never retry
-const pendingClaims = new Map<string, string>(); // cardName → spawnId (our in-flight claims)
+const claimInFlight      = new Set<string>(); // groupJid → claim currently being typed (blocks new spawns only until fired)
+const awaitingConfirm    = new Set<string>(); // groupJid → fired, waiting for CLAIM_SUCCESS/TAKEN (does NOT block new spawns)
+const claimCancelled     = new Set<string>(); // groupJid → abort signal for in-flight claim
+const attemptedSpawns    = new Set<string>(); // spawnId  → already attempted, never retry
+const pendingClaims      = new Map<string, string>(); // cardName → spawnId (our in-flight claims)
+const gsPending          = new Set<string>(); // groupJid → .gs sent, awaiting reply
 
 // ── High-tier always-claim (T4/5/6/S bypass humaniser) ──────────
 const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
@@ -121,7 +123,7 @@ const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
 // Range B (medium): 1000–1300ms — day + active
 // Range C (slow)  : 1500–2000ms — night or inactive
 // Pre-typing pause: 500–1000ms for all tiers
-const DELAY_A: [number, number] = [ 700, 1000];
+const DELAY_A: [number, number] = [ 500,  900]; // T4+ typing: 500–900ms
 const DELAY_B: [number, number] = [1000, 1300];
 const DELAY_C: [number, number] = [1500, 2000];
 
@@ -138,7 +140,7 @@ function pickDelayMs(isHighTier: boolean): number {
 // ── Activity log + humaniser ──────────────────────────────────
 const activityLog = createActivityLog(db);
 const humaniser   = createHumaniser(db);
-let testGcJid: string | null = null; // set by .start command
+let testGcJid: string | null = null; // set by .starttesthere command
 
 // ── WhatsApp connection ──────────────────────────────────────
 async function connectToWhatsApp(): Promise<void> {
@@ -349,6 +351,52 @@ async function handleMessage(
   console.log('[DEBUG] rawText first 80:', rawText?.slice(0, 80));
   console.log('[DEBUG] templateId:', trace.result?.templateId ?? 'null');
 
+  // ── GROUP_STATS detection ─────────────────────────────────
+  // Triggered by .gs reply (full stats) or .anticamp on/off bot confirmation
+  if (groupJid) {
+    const anticampToggle = rawText.match(/Anti-Camping has been turned \*(on|off)\*/i);
+    if (anticampToggle) {
+      const isOn = anticampToggle[1]!.toLowerCase() === 'on';
+      gsPending.delete(groupJid);
+      const { error } = await db.from('groups').update({
+        anticamping:   isOn,
+        gs_scanned_at: new Date().toISOString(),
+        gs_timeout:    false,
+      }).eq('group_id', groupJid);
+      if (error) console.error('[GS-TOGGLE] update failed:', error.message);
+      else console.log(`[GS-TOGGLE] ${groupJid} anticamping → ${isOn}`);
+      return;
+    }
+
+    if (trace.normalized.includes('Anti-Camping:')) {
+      const norm = trace.normalized;
+      const extract = (key: string): string | null =>
+        norm.match(new RegExp(`${key}:\\s*(\\S+)`))?.[1] ?? null;
+
+      const anticamping   = extract('Anti-Camping');
+      const antibot       = extract('Anti-Bot');
+      const cards         = extract('Cards');
+      const canSpawn      = extract('Can Spawn');
+      const participantsS = extract('Participants');
+
+      gsPending.delete(groupJid);
+      const update = {
+        anticamping:   anticamping === 'on',
+        antibot:       antibot === 'on',
+        cards_enabled: cards === 'on',
+        can_spawn:     canSpawn?.toLowerCase() === 'yes',
+        participants:  participantsS ? parseInt(participantsS, 10) : null,
+        gs_scanned_at: new Date().toISOString(),
+        gs_timeout:    false,
+      };
+
+      const { error: gsErr } = await db.from('groups').update(update).eq('group_id', groupJid);
+      if (gsErr) console.error('[GS] update failed:', gsErr.message);
+      else console.log(`[GS] ${groupJid} → anticamping=${update.anticamping} canSpawn=${update.can_spawn} cards=${update.cards_enabled}`);
+      return;
+    }
+  }
+
   // ── CARD_SPAWN fast path ──────────────────────────────────
   if (trace.result?.templateId === 'CARD_SPAWN') {
     if (!groupJid) {
@@ -376,6 +424,7 @@ async function handleMessage(
       return;
     }
     claimInFlight.add(targetGroup);
+    const spawnDetectedAt = Date.now(); // exact moment spawn message arrived
 
     // ── Decision — computed here so both IIFEs share the same values ─────
     const tier = String(f.tier);
@@ -387,6 +436,22 @@ async function handleMessage(
       : { ...(await humaniser.decide({ tier, design: 'unknown', issue: f.issue, activityScore })), delayMs };
 
     console.log(`[CARD] ${f.cardName} (${f.spawnId}) T${tier} #${f.issue} — ${decision.shouldClaim ? 'CLAIMING' : 'SKIPPING'} | delay=${(delayMs/1000).toFixed(2)}s | ${decision.reason}`);
+
+    // ── ntfy — fire on every spawn ───────────────────────────
+    const ntfyTopic = process.env['NTFY_TOPIC'];
+    if (ntfyTopic) {
+      fetch(`https://ntfy.sh/${ntfyTopic}`, {
+        method: 'POST',
+        headers: {
+          'Title':        `T${tier} spawned - Issue #${f.issue}`,
+          'Priority':     isHighTier ? 'urgent' : 'high',
+          'Tags':         isHighTier ? 'rotating_light' : 'bell',
+          'Content-Type': 'text/plain',
+        },
+        body: `Spawn: ${f.spawnId}\nCard: ${f.cardName}\nGroup: ${targetGroup}\n${decision.shouldClaim ? '✓ Claiming' : '✗ Skipping'}`,
+      }).then(() => console.log('[NTFY] Sent'))
+        .catch((e: Error) => console.error('[NTFY] Failed:', e.message));
+    }
 
     // ── Claim flow: pause → type → fire → retry ─────────────────
     void (async () => {
@@ -423,8 +488,8 @@ async function handleMessage(
         return;
       }
 
-      // 3. Pre-typing pause — 500–1000ms
-      const prePause = 500 + Math.random() * 500;
+      // 3. Pre-typing pause — 700–1350ms for all tiers
+      const prePause = 700 + Math.random() * 650;
       await new Promise<void>(r => setTimeout(r, prePause));
 
       // 4. Typing starts — stays on until we fire
@@ -450,34 +515,23 @@ async function handleMessage(
 
       // 8. Fire — message first, stop typing after (no gap)
       pendingClaims.set(f.cardName, f.spawnId);
+      const spawnToClaimMs = Date.now() - spawnDetectedAt;
       await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
       typingSim.stopLoop(targetGroup);
-      // Keep claimInFlight alive — used as confirmation flag for retry logic below
-      console.log(`[CLAIMER] .claim ${f.spawnId} sent`);
+      // Release the per-group lock so the next spawn can be processed immediately
+      claimInFlight.delete(targetGroup);
+      // Track separately for retry logic — does NOT block new spawns
+      awaitingConfirm.add(targetGroup);
+      console.log(`[CLAIMER] .claim ${f.spawnId} sent | spawn→claim ${spawnToClaimMs}ms`);
+      void db.from('card_events').update({ spawn_to_claim_ms: spawnToClaimMs }).eq('spawn_id', f.spawnId);
 
-      // 9. ntfy push notification
-      const ntfyTopic = process.env['NTFY_TOPIC'];
-      if (ntfyTopic) {
-        fetch(`https://ntfy.sh/${ntfyTopic}`, {
-          method: 'POST',
-          headers: {
-            'Title':        `T${tier} claimed - Issue #${f.issue}`,
-            'Priority':     isHighTier ? 'urgent' : 'high',
-            'Tags':         isHighTier ? 'rotating_light' : 'bell',
-            'Content-Type': 'text/plain',
-          },
-          body: `Spawn: ${f.spawnId}\nCard: ${f.cardName}\nGroup: ${targetGroup}`,
-        }).then(() => console.log('[NTFY] Sent'))
-          .catch((e: Error) => console.error('[NTFY] Failed:', e.message));
-      }
-
-      // 10. Wait for confirmation — retry ONCE after 35–50s only if no reply came
+      // 9. Wait for confirmation — retry ONCE after 35–50s only if no reply came
       // claimInFlight is cleared by CLAIM_SUCCESS/CLAIM_TAKEN handlers — that is our signal
       const retryAfterMs = 35000 + Math.random() * 15000;
       await new Promise<void>(r => setTimeout(r, retryAfterMs));
 
-      // If CLAIM_SUCCESS or CLAIM_TAKEN arrived during the wait — they cleared claimInFlight
-      if (!claimInFlight.has(targetGroup) || claimCancelled.has(targetGroup)) {
+      // If CLAIM_SUCCESS or CLAIM_TAKEN arrived during the wait — they cleared awaitingConfirm
+      if (!awaitingConfirm.has(targetGroup) || claimCancelled.has(targetGroup)) {
         claimCancelled.delete(targetGroup);
         console.log(`[CLAIMER] ${f.spawnId} confirmed during wait — no retry needed`);
         return;
@@ -485,7 +539,7 @@ async function handleMessage(
 
       console.log(`[CLAIMER] No confirmation for ${f.spawnId} — retrying once`);
       await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
-      claimInFlight.delete(targetGroup);
+      awaitingConfirm.delete(targetGroup);
     })();
 
     void (async () => {
@@ -496,7 +550,6 @@ async function handleMessage(
         .maybeSingle();
 
       if (existing) {
-        claimInFlight.delete(targetGroup);
         console.log(`[CARD] ${f.spawnId} already in DB — duplicate delivery`);
         return;
       }
@@ -538,11 +591,13 @@ async function handleMessage(
       } else {
         console.log(`[CARD] ${f.cardName} (${f.spawnId}) saved`);
         // Write decision now — row guaranteed to exist
-        void db.from('card_events').update({
+        const { error: decErr } = await db.from('card_events').update({
           decision_should_claim: decision.shouldClaim,
           decision_reason:       decision.reason,
           decision_delay_ms:     decision.delayMs,
         }).eq('spawn_id', f.spawnId);
+        if (decErr) console.error('[DECISION_UPDATE ERROR]', decErr.message);
+        else console.log(`[DECISION] ${f.spawnId} written: shouldClaim=${decision.shouldClaim} reason=${decision.reason}`);
       }
 
       void db.from('parse_log').insert({
@@ -626,7 +681,7 @@ async function handleMessage(
     const cmd = rawText.trim();
 
     // .start — register this GC as the activity-log test GC (fires once)
-    if (cmd === '.start' && testGcJid === null) {
+    if (cmd === '.starttesthere' && testGcJid === null) {
       testGcJid = groupJid;
       const name = groupNameCache.get(groupJid)?.name ?? groupJid;
       await activityLog.record({ groupId: groupJid, messageId: messageId ?? null });
@@ -700,6 +755,75 @@ async function handleMessage(
         const summary = await cleaner.clean();
         await sock.sendMessage(groupJid, { text: `✅ Done\n${summary}` });
       })();
+      return;
+    }
+
+    // .gscan — send .gs to every known group, 3min apart, 2min timeout per group
+    if (cmd === '.gscan' && groupJid !== testGcJid) {
+      await sock.sendMessage(groupJid, { text: `❌ Not the test GC. Run .starttesthere here first (current testGC: ${testGcJid ?? 'none'})` });
+      return;
+    }
+    if (cmd === '.gscan' && groupJid === testGcJid) {
+      void (async () => {
+        const { data: gcList, error: gErr } = await db.from('groups').select('group_id, name');
+        if (gErr || !gcList?.length) {
+          await sock.sendMessage(groupJid, { text: `❌ gscan failed: ${gErr?.message ?? 'no groups'}` });
+          return;
+        }
+        await sock.sendMessage(groupJid, { text: `📡 Scanning ${gcList.length} groups (3min/group)…` });
+
+        let completed = 0;
+        for (let i = 0; i < gcList.length; i++) {
+          const g = gcList[i]!;
+          const label = g.name ?? g.group_id;
+          console.log(`[GSCAN] ${i + 1}/${gcList.length} — sending .gs to ${label}`);
+
+          try {
+            // Brief typing before send (looks natural)
+            typingSim.startLoop(g.group_id);
+            await new Promise<void>(r => setTimeout(r, 1200 + Math.random() * 800));
+            gsPending.add(g.group_id);
+            await sock.sendMessage(g.group_id, { text: '.gs' });
+            typingSim.stopLoop(g.group_id);
+            completed++;
+          } catch (e) {
+            typingSim.stopLoop(g.group_id);
+            gsPending.delete(g.group_id);
+            const msg = (e as Error).message;
+            console.error(`[GSCAN] failed for ${label}:`, msg);
+            // Connection dropped — abort the scan, no point continuing on a dead socket
+            if (msg.includes('Connection Closed') || msg.includes('Connection Failure')) {
+              console.error('[GSCAN] Connection lost — aborting scan');
+              return;
+            }
+            continue;
+          }
+
+          // Wait 2min for reply
+          await new Promise<void>(r => setTimeout(r, 2 * 60 * 1000));
+
+          // Check if reply came — if still pending, mark timeout
+          if (gsPending.has(g.group_id)) {
+            gsPending.delete(g.group_id);
+            await db.from('groups').update({
+              gs_scanned_at: new Date().toISOString(),
+              gs_timeout:    true,
+            }).eq('group_id', g.group_id);
+            console.log(`[GSCAN] ${label} — timeout (no reply in 2min)`);
+          }
+
+          // Wait remaining 1min before next group (3min total interval)
+          if (i < gcList.length - 1) {
+            await new Promise<void>(r => setTimeout(r, 60 * 1000));
+          }
+        }
+
+        try {
+          await sock.sendMessage(groupJid, { text: `✅ gscan complete — ${completed}/${gcList.length} groups reached` });
+        } catch {
+          console.log(`[GSCAN] complete — ${completed}/${gcList.length} groups reached (couldn't notify, connection gone)`);
+        }
+      })().catch(e => console.error('[GSCAN] Unhandled error:', (e as Error).message));
       return;
     }
 
@@ -780,7 +904,7 @@ async function handleMessage(
   if (trace.result?.templateId === 'CLAIM_SUCCESS') {
     if (groupJid) {
       claimCancelled.add(groupJid); // stop any pending retry
-      claimInFlight.delete(groupJid);
+      awaitingConfirm.delete(groupJid);
     }
     console.log(`[CLAIM_SUCCESS] quotedMessageId=${quotedMessageId ?? 'null'}`);
 
@@ -853,7 +977,7 @@ async function handleMessage(
   if (trace.result?.templateId === 'CLAIM_TAKEN' && quotedMessageId) {
     if (groupJid) {
       claimCancelled.add(groupJid); // signal the in-flight claim to abort
-      claimInFlight.delete(groupJid);
+      awaitingConfirm.delete(groupJid);
     }
     const { data: quotedRow, error: qErr } = await db
       .from('parse_log')

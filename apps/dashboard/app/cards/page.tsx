@@ -23,6 +23,7 @@ type CardEvent = {
   decision_should_claim: boolean | null;
   decision_reason: string | null;
   decision_delay_ms: number | null;
+  spawn_to_claim_ms: number | null;
 };
 
 type Filter = 'all' | 'unclaimed' | 'claimed';
@@ -178,7 +179,7 @@ function CardTile({ card, tick, onDelete, groupName }: { card: CardEvent; tick: 
           borderTop: '1px solid var(--border)',
         }}
       >
-        <div style={{ minWidth: 0 }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontWeight: 700, fontSize: 13, lineHeight: 1.3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
             {card.card_name ?? '—'}
           </div>
@@ -194,7 +195,34 @@ function CardTile({ card, tick, onDelete, groupName }: { card: CardEvent; tick: 
             {card.price !== null && (
               <span style={{ fontSize: 11, color: 'var(--muted)' }}>{formatPrice(card.price)}</span>
             )}
+            {/* Claim speed */}
+            {card.spawn_to_claim_ms != null && (
+              <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'monospace' }}>
+                {(card.spawn_to_claim_ms / 1000).toFixed(2)}s
+              </span>
+            )}
           </div>
+          {/* Decision row — always visible */}
+          {card.decision_should_claim !== null && (
+            <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' as const }}>
+              <span style={{
+                fontSize: 10, fontWeight: 700, letterSpacing: '0.04em',
+                padding: '1px 5px', borderRadius: 4,
+                background: card.decision_should_claim ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.06)',
+                color: card.decision_should_claim ? 'var(--blue)' : 'var(--muted)',
+              }}>
+                {card.decision_should_claim ? '✓ CLAIM' : '✗ SKIP'}
+                {card.decision_delay_ms !== null && card.decision_should_claim
+                  ? ` ${(card.decision_delay_ms / 1000).toFixed(1)}s`
+                  : ''}
+              </span>
+              {card.decision_reason && (
+                <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', fontStyle: 'italic', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const, maxWidth: 140 }}>
+                  {card.decision_reason}
+                </span>
+              )}
+            </div>
+          )}
         </div>
         <span style={{ color: 'var(--muted)', fontSize: 14, flexShrink: 0, lineHeight: 1 }}>
           {expanded ? '▲' : '▼'}
@@ -234,10 +262,9 @@ function CardTile({ card, tick, onDelete, groupName }: { card: CardEvent; tick: 
             ] : null,
             card.claimed && card.claimer_jid ? ['Claimer', `+${getNumber(card.claimer_jid)}`] : null,
             card.claimed && card.claimed_at  ? ['Claimed at', relativeTime(card.claimed_at)]  : null,
-            card.claimed && card.claimed_at ? (() => {
-              const diff = (new Date(card.claimed_at).getTime() - new Date(card.created_at).getTime()) / 1000;
-              return diff > 0 ? ['Spawn → claim', <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{diff.toFixed(1)}s</span>] as [string, React.ReactNode] : null;
-            })() : null,
+            card.spawn_to_claim_ms != null
+              ? ['Spawn → claim', <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{(card.spawn_to_claim_ms / 1000).toFixed(3)}s</span>] as [string, React.ReactNode]
+              : null,
           ] as ([string, React.ReactNode] | null)[])
             .filter((r): r is [string, React.ReactNode] => r !== null)
             .map(([label, value]) => (
