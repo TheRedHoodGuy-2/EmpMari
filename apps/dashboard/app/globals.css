@@ -22,6 +22,11 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+html {
+  /* Prevent layout shift and jank from scrollbar appearing */
+  scrollbar-gutter: stable;
+}
+
 html, body {
   background: var(--bg);
   color: var(--text);
@@ -29,7 +34,12 @@ html, body {
   -webkit-font-smoothing: antialiased;
   font-size: 14px;
   line-height: 1.5;
+  /* GPU compositing layer for the whole page */
+  -webkit-backface-visibility: hidden;
 }
+
+/* Instant pointer response — remove 300ms tap delay on mobile */
+* { touch-action: manipulation; }
 
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -103,14 +113,18 @@ html, body {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   padding: 8px 16px; border-radius: 8px;
   font-size: 13px; font-weight: 500;
-  cursor: pointer; transition: all 0.15s;
+  cursor: pointer; transition: background 0.12s, transform 0.1s, box-shadow 0.12s, opacity 0.12s;
   border: none; outline: none; white-space: nowrap;
+  /* Prevent button from eating clicks from siblings */
+  will-change: transform;
+  -webkit-tap-highlight-color: transparent;
 }
+.btn:active { transform: scale(0.96) !important; }
 .btn-primary { background: var(--blue); color: #fff; }
-.btn-primary:hover { background: #2563eb; transform: translateY(-1px); }
-.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.btn-primary:hover { background: #2563eb; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(59,130,246,0.35); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; box-shadow: none; }
 .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border2); }
-.btn-ghost:hover { color: var(--text); border-color: rgba(255,255,255,0.2); }
+.btn-ghost:hover { color: var(--text); border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.04); }
 
 .input {
   background: var(--surface2); border: 1px solid var(--border2);
@@ -182,6 +196,12 @@ html, body {
   overflow-y: auto;
   padding: 32px 36px;
   background: var(--bg);
+  /* Smooth GPU-accelerated scroll */
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+  /* Isolate repaints to this layer */
+  will-change: scroll-position;
 }
 
 .nav-icon {

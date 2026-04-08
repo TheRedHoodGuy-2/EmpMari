@@ -2,8 +2,8 @@
 // @mariabelle/parser — registry
 // ============================================================
 
-import { match } from './engine.js';
-import type { Template, ParseResult, ParseTrace, Registry } from './types.js';
+import { match, multiMatch } from './engine.js';
+import type { Template, MultiTemplate, ParseResult, ParseTrace, Registry } from './types.js';
 
 /**
  * Creates an independent template registry.
@@ -14,7 +14,8 @@ import type { Template, ParseResult, ParseTrace, Registry } from './types.js';
  * controls priority by registration order.
  */
 export function createRegistry(): Registry {
-  const templates: Template[] = [];
+  const templates:      Template[]      = [];
+  const multiTemplates: MultiTemplate[] = [];
 
   function register(template: Template): void {
     templates.push(template);
@@ -26,22 +27,30 @@ export function createRegistry(): Registry {
     }
   }
 
+  function registerMulti(template: MultiTemplate): void {
+    multiTemplates.push(template);
+  }
+
   function get(id: string): Template | undefined {
     return templates.find(t => t.id === id);
   }
 
   function getAll(): Template[] {
-    // Return a shallow copy so external code cannot mutate the internal array.
     return [...templates];
   }
 
   function parse(raw: string): ParseResult | null {
-    return match(raw, templates, false);
+    // Try fixed-line templates first, then multi-line templates
+    return match(raw, templates, false) ?? multiMatch(raw, multiTemplates);
   }
 
   function trace(raw: string): ParseTrace {
-    return match(raw, templates, true);
+    const fixed = match(raw, templates, true);
+    if (fixed.result !== null) return fixed;
+    // Try multi-line templates — result replaces null in the trace
+    const multiResult = multiMatch(raw, multiTemplates);
+    return { ...fixed, result: multiResult };
   }
 
-  return { register, registerAll, get, getAll, parse, trace };
+  return { register, registerAll, registerMulti, get, getAll, parse, trace };
 }

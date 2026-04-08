@@ -19,44 +19,38 @@ export async function GET() {
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   if (!bots || bots.length === 0) return NextResponse.json([]);
 
-  const jids = (bots as { jid: string }[]).map(b => b.jid);
+  // 2. All known groups (for name lookup)
+  const { data: gcRows } = await anonClient
+    .from('groups')
+    .select('group_id, name');
+  const gcNameMap = new Map<string, string | null>(
+    (gcRows ?? []).map(g => [g.group_id as string, g.name as string | null])
+  );
 
-  // 2. Associated group_ids from parse_log
-  const { data: groupRows } = await anonClient
-    .from('parse_log')
-    .select('sender_jid, group_id')
-    .in('sender_jid', jids)
-    .not('group_id', 'is', null);
+  // 3. Per-bot: find distinct group_ids from parse_log where sender_jid contains bot number.
+  //    JID format is "<number>@s.whatsapp.net" or "<number>@lid" — number is the reliable key.
+  const typedBots = bots as { id: string; created_at: string; jid: string; number: string; status: string; moniker: string | null }[];
 
-  const gcMap = new Map<string, Set<string>>();
-  for (const row of (groupRows ?? [])) {
-    if (!row.group_id) continue;
-    if (!gcMap.has(row.sender_jid)) gcMap.set(row.sender_jid, new Set());
-    gcMap.get(row.sender_jid)!.add(row.group_id);
-  }
+  const result = await Promise.all(typedBots.map(async (bot) => {
+    // Search parse_log for this bot's number in sender_jid (handles JID format variations)
+    const { data: logRows } = await anonClient
+      .from('parse_log')
+      .select('group_id')
+      .like('sender_jid', `%${bot.number}%`)
+      .not('group_id', 'is', null)
+      .limit(1000);
 
-  // 4. Group names from groups table
-  const allGroupIds = Array.from(new Set((groupRows ?? []).map(r => r.group_id).filter(Boolean)));
-  const gcNameMap = new Map<string, string>();
-  if (allGroupIds.length > 0) {
-    const { data: gcNameRows } = await anonClient
-      .from('groups')
-      .select('group_id, name')
-      .in('group_id', allGroupIds);
-    for (const g of (gcNameRows ?? [])) {
-      if (g.name) gcNameMap.set(g.group_id, g.name);
+    const seenGroupIds = new Set<string>();
+    for (const r of (logRows ?? [])) {
+      if (r.group_id) seenGroupIds.add(r.group_id as string);
     }
-  }
 
-  // 4. Assemble
-  const result = (bots as {
-    id: string; created_at: string; jid: string; number: string; status: string; moniker: string | null;
-  }[]).map(b => ({
-    ...b,
-    groups: Array.from(gcMap.get(b.jid) ?? []).map(gcId => ({
+    const groups = Array.from(seenGroupIds).map(gcId => ({
       id:   gcId,
       name: gcNameMap.get(gcId) ?? null,
-    })),
+    }));
+
+    return { ...bot, groups };
   }));
 
   return NextResponse.json(result);

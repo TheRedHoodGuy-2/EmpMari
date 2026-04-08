@@ -2,6 +2,8 @@
 // Mariabelle WhatsApp Bot
 // receive → classify → parse → log + card_events
 // ============================================================
+import { patchConsole } from './console-colors.js';
+patchConsole(); // coloured terminal output — must be first
 
 import qrcode from 'qrcode-terminal';
 import makeWASocket, {
@@ -32,7 +34,7 @@ import {
 } from '@mariabelle/identifier';
 import { createImager } from '@mariabelle/imager';
 import { db }                from './db.js';
-import { initClaimer }       from './claimer.js';
+import { initClaimer, setSendRecorder } from './claimer.js';
 import { createCleaner }     from './cleaner.js';
 import { createActivityLog } from '@mariabelle/activity-log';
 import { detectCard }        from '@mariabelle/card-detector';
@@ -111,9 +113,20 @@ const BOT_NAMES = new Set([
 const claimInFlight      = new Set<string>(); // groupJid → claim currently being typed (blocks new spawns only until fired)
 const awaitingConfirm    = new Set<string>(); // groupJid → fired, waiting for CLAIM_SUCCESS/TAKEN (does NOT block new spawns)
 const claimCancelled     = new Set<string>(); // groupJid → abort signal for in-flight claim
-const attemptedSpawns    = new Set<string>(); // spawnId  → already attempted, never retry
+const attemptedSpawns    = new Set<string>(); // spawnId  → already attempted, survives via DB hydration on reconnect
 const pendingClaims      = new Map<string, string>(); // cardName → spawnId (our in-flight claims)
 const gsPending          = new Set<string>(); // groupJid → .gs sent, awaiting reply
+
+// Hydrate attemptedSpawns from DB on connect — prevents re-claiming after reconnect.
+// Loads any spawn we touched in the last 2 hours (cards expire long before that).
+async function hydrateAttemptedSpawns() {
+  const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const { data } = await db.from('card_events').select('spawn_id').gte('created_at', since);
+  for (const row of data ?? []) {
+    if (row.spawn_id) attemptedSpawns.add(row.spawn_id as string);
+  }
+  console.log(`[CONN] Hydrated ${attemptedSpawns.size} attempted spawns from DB`);
+}
 
 // ── High-tier always-claim (T4/5/6/S bypass humaniser) ──────────
 const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
@@ -122,7 +135,7 @@ const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
 // Range A (fast)  :  700–1000ms — T4/5/6/S always
 // Range B (medium): 1000–1300ms — day + active
 // Range C (slow)  : 1500–2000ms — night or inactive
-// Pre-typing pause: 500–1000ms for all tiers
+// Pre-typing pause: 200–500ms for all tiers
 const DELAY_A: [number, number] = [ 500,  900]; // T4+ typing: 500–900ms
 const DELAY_B: [number, number] = [1000, 1300];
 const DELAY_C: [number, number] = [1500, 2000];
@@ -141,6 +154,80 @@ function pickDelayMs(isHighTier: boolean): number {
 const activityLog = createActivityLog(db);
 const humaniser   = createHumaniser(db);
 let testGcJid: string | null = null; // set by .starttesthere command
+
+// ── Send-latency rolling average ──────────────────────────────
+// recordSend() is called after every .claim send.
+// A separate 5s interval flushes the rolling avg to control_config.
+const sendLatencyBucket: number[] = [];
+let latencyFlushTimer: ReturnType<typeof setInterval> | null = null;
+
+function recordSend(ms: number) {
+  sendLatencyBucket.push(ms);
+}
+
+function startLatencyFlush() {
+  if (latencyFlushTimer) clearInterval(latencyFlushTimer);
+  latencyFlushTimer = setInterval(() => {
+    if (sendLatencyBucket.length === 0) return;
+    const avg = Math.round(sendLatencyBucket.reduce((a, b) => a + b, 0) / sendLatencyBucket.length);
+    sendLatencyBucket.length = 0;
+    void db.from('control_config').upsert(
+      { singleton: 'X', last_send_latency_ms: avg },
+      { onConflict: 'singleton' },
+    ).then(({ error }) => { if (error) console.error('[LATENCY]', error.message); });
+  }, 5_000);
+}
+
+// ── Connection status helper ───────────────────────────────────
+function writeConnectionStatus(status: 'connected' | 'connecting' | 'disconnected') {
+  void db.from('control_config').upsert(
+    { singleton: 'X', connection_status: status, heartbeat_at: new Date().toISOString() },
+    { onConflict: 'singleton' },
+  ).then(({ error }) => { if (error) console.error('[CONN-STATUS]', error.message); });
+}
+
+// ── Bot heartbeat ─────────────────────────────────────────────
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+  const supabaseUrl = process.env['SUPABASE_URL'] ?? process.env['NEXT_PUBLIC_SUPABASE_URL'] ?? '';
+  const supabaseKey = process.env['SUPABASE_SERVICE_ROLE_KEY'] ?? '';
+  // Raw HTTP fetch bypasses JS client connection pool — real round-trip
+  const pingUrl = `${supabaseUrl}/rest/v1/bot_heartbeat?singleton=eq.X&select=singleton`;
+
+  const ping = async () => {
+    try {
+      const t0  = Date.now();
+      const res = await fetch(pingUrl, {
+        headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` },
+        signal: AbortSignal.timeout(10_000),
+        cache: 'no-store',
+      });
+      const ms = Date.now() - t0;
+      if (!res.ok) throw new Error(`Ping HTTP ${res.status}`);
+
+      const now = new Date().toISOString();
+      // Write ping to bot_heartbeat (for the ping widget)
+      await db.from('bot_heartbeat').upsert(
+        { singleton: 'X', pinged_at: now, latency_ms: ms, status: 'online' },
+        { onConflict: 'singleton' },
+      );
+      // Write heartbeat timestamp to control_config (for the bot status widget)
+      await db.from('control_config').upsert(
+        { singleton: 'X', heartbeat_at: now, connection_status: 'connected' },
+        { onConflict: 'singleton' },
+      );
+      console.log(`[HEARTBEAT] ${ms}ms`);
+    } catch (e) {
+      console.error('[HEARTBEAT]', (e as Error).message);
+    }
+  };
+
+  void ping();
+  heartbeatTimer = setInterval(() => void ping(), 60_000);
+  console.log('[HEARTBEAT] Started (60s interval)');
+}
 
 // ── WhatsApp connection ──────────────────────────────────────
 async function connectToWhatsApp(): Promise<void> {
@@ -175,6 +262,7 @@ async function connectToWhatsApp(): Promise<void> {
   }, { loopIntervalMs: 4000 });
 
   const claimer  = initClaimer(sock, typingSim);
+  setSendRecorder(recordSend);
   const cleaner  = createCleaner(db, sock, lidMap);
 
   // ── LID resolver ─────────────────────────────────────────────
@@ -202,10 +290,17 @@ async function connectToWhatsApp(): Promise<void> {
     if (connection === 'open') {
       reconnectCount = 0;
       console.log('[MARIABELLE] Connected');
-      // Pre-warm humaniser cache so decide() is instant on first card spawn
+      writeConnectionStatus('connected');
       void humaniser.warmCache().then(() => console.log('[HUMANISER] Cache warmed'));
+      void hydrateAttemptedSpawns();
+      startHeartbeat();
+      startLatencyFlush();
+    }
+    if (connection === 'connecting') {
+      writeConnectionStatus('connecting');
     }
     if (connection === 'close') {
+      writeConnectionStatus('disconnected');
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode ?? 0;
       const loggedOut  = statusCode === DisconnectReason.loggedOut;
       console.log(`[CONN] Disconnected — status ${statusCode}`);
@@ -342,6 +437,26 @@ async function handleMessage(
     );
   }
 
+  // ── People tracking — passive, every message ─────────────
+  if (senderJid && !fromMe) {
+    void (async () => {
+      const normJid = normalizeJid(senderJid);
+      const { data: existing } = await db.from('people').select('gcs').eq('jid', normJid).maybeSingle();
+      const currentGcs: string[] = (existing?.gcs as string[] | null) ?? [];
+      const updatedGcs = groupJid && !currentGcs.includes(groupJid)
+        ? [...currentGcs, groupJid]
+        : currentGcs;
+      await db.from('people').upsert({
+        jid:          normJid,
+        number:       getNumber(senderJid),
+        display_name: msg.pushName ?? null,
+        gcs:          updatedGcs,
+        last_seen:    new Date().toISOString(),
+        updated_at:   new Date().toISOString(),
+      }, { onConflict: 'jid' });
+    })();
+  }
+
   // ── Parse first (sync) ───────────────────────────────────
   const trace = registry.trace(rawText);
 
@@ -397,10 +512,151 @@ async function handleMessage(
     }
   }
 
+  // ── MY_SERIES ─────────────────────────────────────────────
+  if (trace.result?.templateId === 'MY_SERIES') {
+    const series = (trace.result.fields as { series: { name: string; count: number }[] }).series;
+
+    // The Tensura bot REPLIES to whoever ran .myseries.
+    // contextInfo.participant is the JID of the sender of the quoted/replied-to message.
+    // That person IS the owner of the series list — use it directly, no DB lookup needed.
+    const ctx            = msg.message?.extendedTextMessage?.contextInfo;
+    const quotedSenderJid = ctx?.participant ?? ctx?.remoteJid ?? null;
+
+    if (!quotedSenderJid) {
+      console.warn('[SERIES] MY_SERIES: contextInfo.participant missing — cannot determine owner, skipping');
+      return;
+    }
+
+    const realOwnerJid = normalizeJid(quotedSenderJid);
+    console.log(`[SERIES] MY_SERIES owner resolved → ${realOwnerJid} (${series.length} series)`);
+
+    void (async () => {
+      for (const s of series) {
+        await db.from('player_series').upsert({
+          jid:        realOwnerJid,
+          series:     s.name,
+          card_count: s.count,
+          gc_id:      groupJid,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'jid,series' });
+      }
+      console.log(`[SERIES] Saved ${series.length} series for ${realOwnerJid}`);
+    })();
+  }
+
+  // ── SERIES_LEADERBOARD ────────────────────────────────────
+  if (trace.result?.templateId === 'SERIES_LEADERBOARD') {
+    const { series, leaders } = trace.result.fields as {
+      series:  string;
+      leaders: { rank: number; name: string; count: number }[];
+    };
+    void (async () => {
+      for (const leader of leaders) {
+        await db.from('series_leaders').upsert({
+          series:      series,
+          rank:        leader.rank,
+          player_name: leader.name,
+          card_count:  leader.count,
+          gc_id:       groupJid,
+          seen_at:     new Date().toISOString(),
+        }, { onConflict: 'series,rank,gc_id' });
+      }
+      console.log(`[SERIES] Updated leaderboard for ${series} (${leaders.length} entries)`);
+    })();
+  }
+
+  // ── CARD_COLLECTION ───────────────────────────────────────
+  if (trace.result?.templateId === 'CARD_COLLECTION') {
+    const { cards } = trace.result.fields as { cards: { name: string; tier: number }[] };
+
+    const ctx             = msg.message?.extendedTextMessage?.contextInfo;
+    const quotedSenderJid = ctx?.participant ?? ctx?.remoteJid ?? null;
+
+    if (!quotedSenderJid) {
+      console.warn('[COL] CARD_COLLECTION: contextInfo.participant missing — cannot determine owner, skipping');
+      return;
+    }
+
+    const ownerJid = normalizeJid(quotedSenderJid);
+    console.log(`[COL] CARD_COLLECTION owner → ${ownerJid} (${cards.length} cards)`);
+
+    void (async () => {
+      // 1. Delete current collection for this jid+gc (handle null gc_id correctly)
+      const deleteQ = db.from('player_cards').delete().eq('jid', ownerJid);
+      const { error: delErr } = groupJid
+        ? await deleteQ.eq('gc_id', groupJid)
+        : await deleteQ.is('gc_id', null);
+      if (delErr) console.error('[COL] delete error:', delErr.message);
+
+      // 2. Batch-look up card_ids by name+tier — fetch all matching names then filter by tier in code
+      //    so T4 "Momo" and T6 "Momo" resolve to different card_ids.
+      const cardNames = cards.map(c => c.name);
+      const { data: dbMatches, error: lookupErr } = await db
+        .from('card_db')
+        .select('card_id,name,tier')
+        .in('name', cardNames);
+      if (lookupErr) console.error('[COL] card_db lookup error:', lookupErr.message);
+
+      // Key: "name|tier" — tier in card_db is stored as string ('1','2',...,'S')
+      const cardIdMap = new Map<string, string>();
+      for (const r of (dbMatches ?? []) as { card_id: string; name: string; tier: string | null }[]) {
+        cardIdMap.set(`${r.name}|${r.tier ?? ''}`, r.card_id);
+      }
+
+      // 3. Insert the new collection
+      const rows = cards.map(card => ({
+        jid:        ownerJid,
+        card_id:    cardIdMap.get(`${card.name}|${card.tier}`) ?? cardIdMap.get(`${card.name}|${String(card.tier)}`) ?? null,
+        card_name:  card.name,
+        tier:       card.tier,
+        gc_id:      groupJid ?? null,
+        updated_at: new Date().toISOString(),
+      }));
+
+      const { error: insErr } = await db.from('player_cards').insert(rows);
+      if (insErr) {
+        console.error('[COL] insert error:', insErr.message);
+      } else {
+        console.log(`[COL] Saved ${rows.length} cards for ${ownerJid} (${cardIdMap.size}/${cards.length} matched in card_db)`);
+      }
+    })();
+  }
+
   // ── CARD_SPAWN fast path ──────────────────────────────────
   if (trace.result?.templateId === 'CARD_SPAWN') {
     if (!groupJid) {
       console.log(`[CARD] CARD_SPAWN in DM from ${senderJid} — ignored`);
+      return;
+    }
+
+    // ── Gate 1: sender must be a known bot OR message is from test GC ──
+    // Check this FIRST — before logging, ntfy, or anything else.
+    // Real GCs: sender must be in known_bots.
+    // Test GC:  only fromMe (self) messages are trusted as fake spawns.
+    const isTestGc = groupJid === testGcJid;
+    if (!isTestGc) {
+      const jidsToCheck = [normalizeJid(senderJid)];
+      if (rawLid) jidsToCheck.push(rawLid);
+      const { data: botRow } = await db
+        .from('known_bots')
+        .select('jid')
+        .in('jid', jidsToCheck)
+        .maybeSingle();
+      if (!botRow) {
+        console.log(`[CARD] IGNORED — sender "${msg.pushName ?? senderJid}" not in known_bots (jid=${normalizeJid(senderJid)}, lid=${rawLid ?? 'none'})`);
+        // Auto-register if name matches known bot list for next time
+        if (BOT_NAMES.has(msg.pushName?.trim() ?? '')) {
+          void db.from('known_bots').upsert(
+            { jid: normalizeJid(senderJid), lid: rawLid, number: getNumber(senderJid), moniker: msg.pushName ?? null, status: 'unverified' },
+            { onConflict: 'jid' },
+          );
+          console.log(`[BOT AUTO-REG] "${msg.pushName}" registered as unverified`);
+        }
+        return; // ← hard stop — no ntfy, no DB, nothing
+      }
+    } else if (!fromMe) {
+      // Test GC: only self (fromMe) can trigger fake spawns — ignore everyone else
+      console.log(`[CARD] IGNORED — test GC spawn not from self (${msg.pushName ?? senderJid})`);
       return;
     }
 
@@ -413,11 +669,26 @@ async function handleMessage(
     };
     const targetGroup = groupJid;
 
-    // Per-spawnId dedup — if we already attempted this spawn, ignore
+    console.log(`[SPAWN] Received spawn: ${f.spawnId} — messageId: ${messageId ?? 'null'}`);
+
+    // Layer 1: fast in-memory check (survives within a session)
     if (attemptedSpawns.has(f.spawnId)) {
-      console.log(`[CARD] ${f.spawnId} already attempted — duplicate delivery ignored`);
+      console.log(`[CARD] ${f.spawnId} already in memory — duplicate delivery ignored`);
       return;
     }
+
+    // Layer 2: DB check — survives restarts/reconnects
+    const { data: existingRow } = await db
+      .from('card_events')
+      .select('id, claimed')
+      .eq('spawn_id', f.spawnId)
+      .maybeSingle();
+    if (existingRow) {
+      console.log(`[CARD] ${f.spawnId} already in DB (claimed=${String(existingRow.claimed)}) — skipping`);
+      attemptedSpawns.add(f.spawnId); // sync back to memory
+      return;
+    }
+
     // Per-group dedup — only one claim in flight per group
     if (claimInFlight.has(targetGroup)) {
       console.log(`[CARD] ${f.spawnId} skipped — claim already in-flight for this group`);
@@ -426,7 +697,7 @@ async function handleMessage(
     claimInFlight.add(targetGroup);
     const spawnDetectedAt = Date.now(); // exact moment spawn message arrived
 
-    // ── Decision — computed here so both IIFEs share the same values ─────
+    // ── Decision ──────────────────────────────────────────────
     const tier = String(f.tier);
     const activityScore = (await activityLog.getScore(targetGroup)).score;
     const isHighTier = HIGH_TIERS.has(tier);
@@ -437,59 +708,33 @@ async function handleMessage(
 
     console.log(`[CARD] ${f.cardName} (${f.spawnId}) T${tier} #${f.issue} — ${decision.shouldClaim ? 'CLAIMING' : 'SKIPPING'} | delay=${(delayMs/1000).toFixed(2)}s | ${decision.reason}`);
 
-    // ── ntfy — fire on every spawn ───────────────────────────
+    // ── ntfy — only when we are actually claiming ────────────
     const ntfyTopic = process.env['NTFY_TOPIC'];
-    if (ntfyTopic) {
+    if (ntfyTopic && decision.shouldClaim) {
       fetch(`https://ntfy.sh/${ntfyTopic}`, {
         method: 'POST',
         headers: {
-          'Title':        `T${tier} spawned - Issue #${f.issue}`,
+          'Title':        `Claiming T${tier} - Issue #${f.issue}`,
           'Priority':     isHighTier ? 'urgent' : 'high',
           'Tags':         isHighTier ? 'rotating_light' : 'bell',
           'Content-Type': 'text/plain',
         },
-        body: `Spawn: ${f.spawnId}\nCard: ${f.cardName}\nGroup: ${targetGroup}\n${decision.shouldClaim ? '✓ Claiming' : '✗ Skipping'}`,
+        body: `Card: ${f.cardName}\nSpawn: ${f.spawnId}\nGroup: ${targetGroup}\nReason: ${decision.reason}`,
       }).then(() => console.log('[NTFY] Sent'))
         .catch((e: Error) => console.error('[NTFY] Failed:', e.message));
     }
 
     // ── Claim flow: pause → type → fire → retry ─────────────────
+    // Bot/sender already verified in Gate 1 above — proceed directly.
     void (async () => {
-      // Bot registration gate — test GC bypasses, real GCs require known_bots (JID or LID check)
-      const isTestGc = groupJid !== null && groupJid === testGcJid;
-      if (!isTestGc) {
-        // Try both the resolved JID and the raw LID — whichever is stored in known_bots
-        const jidsToCheck = [normalizeJid(senderJid)];
-        if (rawLid) jidsToCheck.push(rawLid);
-        const { data: botRow } = await db
-          .from('known_bots')
-          .select('jid')
-          .in('jid', jidsToCheck)
-          .maybeSingle();
-        if (!botRow) {
-          // If name matches known bot list, auto-register for next time but skip this claim
-          if (BOT_NAMES.has(msg.pushName?.trim() ?? '')) {
-            await db.from('known_bots').upsert(
-              { jid: normalizeJid(senderJid), lid: rawLid, number: getNumber(senderJid), moniker: msg.pushName ?? null, status: 'unverified' },
-              { onConflict: 'jid' },
-            );
-            console.log(`[BOT AUTO-REG] "${msg.pushName}" registered as unverified — skipping this claim`);
-          } else {
-            console.log(`[CARD] ${f.spawnId} — unregistered sender "${msg.pushName ?? senderJid}" (jid=${normalizeJid(senderJid)}, lid=${rawLid ?? 'none'}) — skipping claim`);
-          }
-          claimInFlight.delete(targetGroup);
-          return;
-        }
-      }
-
-      // 2. If skipping — do nothing, no typing flash, no tell
+      // 1. If skipping — do nothing, no typing flash, no tell
       if (!decision.shouldClaim) {
         claimInFlight.delete(targetGroup);
         return;
       }
 
-      // 3. Pre-typing pause — 700–1350ms for all tiers
-      const prePause = 700 + Math.random() * 650;
+      // 2. Pre-typing pause — 200–500ms for all tiers
+      const prePause = 200 + Math.random() * 300;
       await new Promise<void>(r => setTimeout(r, prePause));
 
       // 4. Typing starts — stays on until we fire
@@ -510,53 +755,40 @@ async function handleMessage(
         return;
       }
 
-      // 7. Mark spawnId as attempted — no matter what happens next, never fire again
+      // 7. Mark spawnId attempted in memory AND DB before sending — if bot
+      //    restarts between here and sendMessage, the next delivery sees the
+      //    DB row (layer 2 check above) and skips. No duplicate sends ever.
       attemptedSpawns.add(f.spawnId);
+      await db.from('card_events').upsert({
+        group_id:  targetGroup,
+        spawn_id:  f.spawnId,
+        card_name: f.cardName,
+        tier:      String(f.tier),
+        price:     f.price,
+        issue:     f.issue,
+        claimed:   false,
+        decision_should_claim: decision.shouldClaim,
+        decision_reason:       decision.reason,
+      }, { onConflict: 'spawn_id' });
 
       // 8. Fire — message first, stop typing after (no gap)
       pendingClaims.set(f.cardName, f.spawnId);
       const spawnToClaimMs = Date.now() - spawnDetectedAt;
       await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
       typingSim.stopLoop(targetGroup);
-      // Release the per-group lock so the next spawn can be processed immediately
       claimInFlight.delete(targetGroup);
-      // Track separately for retry logic — does NOT block new spawns
       awaitingConfirm.add(targetGroup);
       console.log(`[CLAIMER] .claim ${f.spawnId} sent | spawn→claim ${spawnToClaimMs}ms`);
       void db.from('card_events').update({ spawn_to_claim_ms: spawnToClaimMs }).eq('spawn_id', f.spawnId);
 
-      // 9. Wait for confirmation — retry ONCE after 35–50s only if no reply came
-      // claimInFlight is cleared by CLAIM_SUCCESS/CLAIM_TAKEN handlers — that is our signal
-      const retryAfterMs = 35000 + Math.random() * 15000;
-      await new Promise<void>(r => setTimeout(r, retryAfterMs));
-
-      // If CLAIM_SUCCESS or CLAIM_TAKEN arrived during the wait — they cleared awaitingConfirm
-      if (!awaitingConfirm.has(targetGroup) || claimCancelled.has(targetGroup)) {
-        claimCancelled.delete(targetGroup);
-        console.log(`[CLAIMER] ${f.spawnId} confirmed during wait — no retry needed`);
-        return;
-      }
-
-      console.log(`[CLAIMER] No confirmation for ${f.spawnId} — retrying once`);
-      await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
-      awaitingConfirm.delete(targetGroup);
+      // 9. NO RETRY — sending .claim twice risks cooldown/flag from Tensura.
+      //    CLAIM_SUCCESS/CLAIM_TAKEN handlers clear awaitingConfirm when reply arrives.
+      //    If no reply comes the card was likely already taken; we already have the DB row.
     })();
 
     void (async () => {
-      const { data: existing } = await db
-        .from('card_events')
-        .select('id')
-        .eq('spawn_id', f.spawnId)
-        .maybeSingle();
-
-      if (existing) {
-        console.log(`[CARD] ${f.spawnId} already in DB — duplicate delivery`);
-        return;
-      }
-
-      let imageUrl: string | null = null;
-      let imageId:  string | null = null;
-
+      // Row is already in DB (written before .claim was sent).
+      // Download image if present and patch it onto the existing row.
       if (hasImage) {
         try {
           const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
@@ -568,36 +800,14 @@ async function handleMessage(
             imageBuffer: buffer as Buffer,
             detectedAt:  new Date(),
           });
-          if (stored) { imageUrl = stored.publicUrl; imageId = stored.id; }
+          if (stored) {
+            void db.from('card_events')
+              .update({ image_url: stored.publicUrl, image_id: stored.id })
+              .eq('spawn_id', f.spawnId);
+          }
         } catch (e: unknown) {
           console.error('[IMAGE] Failed:', e instanceof Error ? e.message : String(e));
         }
-      }
-
-      const { error: cardError } = await db.from('card_events').upsert({
-        group_id:  targetGroup,
-        spawn_id:  f.spawnId,
-        card_name: f.cardName,
-        tier:      String(f.tier),
-        price:     f.price,
-        issue:     f.issue,
-        image_url: imageUrl,
-        image_id:  imageId,
-        claimed:   false,
-      }, { onConflict: 'spawn_id' });
-
-      if (cardError) {
-        console.error('[CARD_INSERT ERROR]', cardError.message);
-      } else {
-        console.log(`[CARD] ${f.cardName} (${f.spawnId}) saved`);
-        // Write decision now — row guaranteed to exist
-        const { error: decErr } = await db.from('card_events').update({
-          decision_should_claim: decision.shouldClaim,
-          decision_reason:       decision.reason,
-          decision_delay_ms:     decision.delayMs,
-        }).eq('spawn_id', f.spawnId);
-        if (decErr) console.error('[DECISION_UPDATE ERROR]', decErr.message);
-        else console.log(`[DECISION] ${f.spawnId} written: shouldClaim=${decision.shouldClaim} reason=${decision.reason}`);
       }
 
       void db.from('parse_log').insert({
@@ -902,42 +1112,47 @@ async function handleMessage(
 
   // ── CLAIM_SUCCESS ─────────────────────────────────────────
   if (trace.result?.templateId === 'CLAIM_SUCCESS') {
-    if (groupJid) {
-      claimCancelled.add(groupJid); // stop any pending retry
-      awaitingConfirm.delete(groupJid);
-    }
     console.log(`[CLAIM_SUCCESS] quotedMessageId=${quotedMessageId ?? 'null'}`);
 
     let spawnId:    string | null = null;
     let claimerJid: string | null = null;
+    let ourClaim    = false; // true only when success is a reply to OUR .claim message
 
     if (quotedMessageId) {
       const { data: quotedRow, error: qErr } = await db
         .from('parse_log')
-        .select('sender_jid, fields_json, raw_text')
+        .select('sender_jid, sender_type, fields_json, raw_text')
         .eq('message_id', quotedMessageId)
         .maybeSingle();
       if (qErr) console.error('[CLAIM_SUCCESS] quotedRow lookup error:', qErr.message);
       if (quotedRow) {
         claimerJid = quotedRow.sender_jid as string;
-        // Try fields_json first (spawn message), then parse spawnId from raw .claim text
-        spawnId = (quotedRow.fields_json as { spawnId?: string } | null)?.spawnId
-          ?? (quotedRow.raw_text as string | null)?.match(/\.claim\s+([a-z0-9]+)/i)?.[1]
+        const rawQuoted = (quotedRow.raw_text as string | null) ?? '';
+        // The quoted message is our .claim if: sender_type='self' AND text starts with .claim
+        ourClaim = quotedRow.sender_type === 'self' && /^\.claim\s+/i.test(rawQuoted.trim());
+        spawnId  = rawQuoted.match(/\.claim\s+([a-z0-9]+)/i)?.[1]
+          ?? (quotedRow.fields_json as { spawnId?: string } | null)?.spawnId
           ?? null;
       }
     }
 
+    // Card is claimed by ANYONE — always cancel our pending retry for this group.
+    // There's no point resending .claim if someone already got the card.
+    if (groupJid) {
+      claimCancelled.add(groupJid);
+      awaitingConfirm.delete(groupJid);
+    }
+
     if (!spawnId) {
-      // L0 of CLAIM_SUCCESS captures the name with WhatsApp bold markers (*name*)
-      // Strip them before lookup — normalizer only handles math-unicode, not markdown
+      // Fallback: match by card name from the success message fields
       const rawCardName = (trace.result.fields as { cardName?: string } | undefined)?.cardName ?? null;
       const cardName    = rawCardName?.replace(/\*/g, '') ?? null;
       if (cardName) {
-        // Check in-memory map first (avoids DB race — card might not be inserted yet)
         if (pendingClaims.has(cardName)) {
-          spawnId = pendingClaims.get(cardName)!;
-          pendingClaims.delete(cardName);
+          spawnId    = pendingClaims.get(cardName)!;
           claimerJid = selfNumber + '@s.whatsapp.net';
+          ourClaim   = true;
+          pendingClaims.delete(cardName);
         } else {
           const { data: cardRow } = await db
             .from('card_events')
@@ -953,10 +1168,10 @@ async function handleMessage(
     }
 
     if (spawnId) {
-      claimer.confirm(spawnId);
-      // claim_source = 'bot' only when the success is tagged to the bot's own claim message
-      const selfJid    = selfNumber + '@s.whatsapp.net';
-      const claimSource = claimerJid && normalizeJid(claimerJid) === normalizeJid(selfJid) ? 'bot' : 'other';
+      if (ourClaim) claimer.confirm(spawnId);
+      const selfJid     = selfNumber + '@s.whatsapp.net';
+      const claimSource = ourClaim && claimerJid && normalizeJid(claimerJid) === normalizeJid(selfJid) ? 'bot' : 'other';
+      console.log(`[CLAIM_SUCCESS] spawnId=${spawnId} ourClaim=${ourClaim} source=${claimSource}`);
       const { error: updateErr } = await db.from('card_events')
         .update({
           claimed:      true,
@@ -967,7 +1182,31 @@ async function handleMessage(
         })
         .eq('spawn_id', spawnId);
       if (updateErr) console.error('[CLAIM_SUCCESS] update failed:', updateErr.message);
-      else console.log(`[CLAIMED] ${spawnId} | source=${claimSource} | by ${claimerJid ? formatDisplay(claimerJid) : 'unknown'}`);
+      else {
+        console.log(`[CLAIMED] ${spawnId} | source=${claimSource} | by ${claimerJid ? formatDisplay(claimerJid) : 'unknown'}`);
+        // Enrich card_events with series metadata from card_db
+        const rawCardName = (trace.result.fields as { cardName?: string } | undefined)?.cardName ?? null;
+        const claimedCardName = rawCardName?.replace(/\*/g, '') ?? null;
+        if (claimedCardName) {
+          void (async () => {
+            const { data: cardData } = await db
+              .from('card_db')
+              .select('card_id, series, tier, stars, image_url, description, event')
+              .ilike('name', `%${claimedCardName}%`)
+              .limit(1)
+              .maybeSingle();
+            if (cardData) {
+              await db.from('card_events').update({
+                card_db_id:  cardData.card_id,
+                series:      cardData.series,
+                description: cardData.description,
+                event_pool:  cardData.event,
+              }).eq('spawn_id', spawnId);
+              console.log(`[ENRICH] ${spawnId} → series=${cardData.series}`);
+            }
+          })();
+        }
+      }
     } else {
       console.warn('[CLAIM_SUCCESS] could not resolve spawnId');
     }

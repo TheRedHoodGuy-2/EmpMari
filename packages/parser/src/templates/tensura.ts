@@ -6,8 +6,7 @@
 // if any doubt exists about emoji codepoints or spacing.
 // ============================================================
 
-import type { Template } from '../types.js';
-import type { Registry } from '../registry.js';
+import type { Template, MultiTemplate, Registry } from '../types.js';
 
 // ─── BOT_PING ────────────────────────────────────────────────
 // Real sample — 2 lines:
@@ -124,44 +123,35 @@ const CARD_SPAWN: Template = {
 };
 
 // ─── CLAIM_SUCCESS ───────────────────────────────────────────
-// Bot quotes the player's .claim message and replies.
-// Real sample: "🎉 You claimed Risty!\n\n🀄 Name: Risty\n⭐ Tier: 1"
-// 4 lines (L0–L3).
-//
-// ⚠️  VERIFY: exact line count, emoji, and whether "Name"/"Tier"
-//     labels have bold markers (*) or not. Sample shows NO bold here.
-const CLAIM_SUCCESS: Template = {
+// Flexible multiMatch — scans all lines for the success marker so that
+// extra lines added by Tensura (e.g. bonus messages, rank-ups) don't
+// cause a miss. The rigid lineCount=4 approach breaks on format changes.
+const CLAIM_SUCCESS: MultiTemplate = {
   id: 'CLAIM_SUCCESS',
-  lineCount: 4,
-  lines: [
-    // L0 — ⚠️ VERIFY: 🎉 codepoint U+1F389
-    {
-      type: 'capture',
-      prefix: '🎉 You claimed ',
-      suffix: '!',
-      key: 'cardName',
-      pattern: /.+/,
-    },
-    // L1 blank
-    { type: 'literal', value: '' },
-    // L2 — confirmed: 🎴 U+1F3B4, no bold on "Name" unlike CARD_SPAWN
-    {
-      type: 'capture',
-      prefix: '🎴 Name: ',
-      suffix: '',
-      key: 'nameConfirm',
-      pattern: /.+/,
-    },
-    // L3 — note: no bold (*) on "Tier" unlike CARD_SPAWN
-    {
-      type: 'capture',
-      prefix: '⭐ Tier: ',
-      suffix: '',
-      key: 'tier',
-      pattern: /[1-9S]/,
-      transform: (v: string): string | number => v === 'S' ? 'S' : parseInt(v, 10),
-    },
-  ],
+  // Start: any line that begins with the success emoji
+  isStart: (line) => line.startsWith('🎉 You claimed '),
+  // End: we capture the tier line, but also stop after a few lines
+  isEnd: (line) => /^⭐\s*Tier:\s*[1-9S]/i.test(line),
+  extract: (lines) => {
+    let cardName: string | null = null;
+    let tier: string | number | null = null;
+
+    for (const line of lines) {
+      // "🎉 You claimed Risty!"
+      if (!cardName) {
+        const m = line.match(/^🎉\s*You claimed\s+(.+?)!?$/);
+        if (m) { cardName = m[1]!.trim(); continue; }
+      }
+      // "⭐ Tier: 4"
+      if (!tier) {
+        const m = line.match(/^⭐\s*Tier:\s*([1-9S])/i);
+        if (m) { tier = m[1] === 'S' ? 'S' : parseInt(m[1]!, 10); }
+      }
+    }
+
+    if (!cardName) return null;
+    return { templateId: 'CLAIM_SUCCESS', fields: { cardName, tier } };
+  },
 };
 
 // ─── CLAIM_TAKEN ─────────────────────────────────────────────
@@ -193,11 +183,98 @@ const PLAYER_CMD_CLAIM: Template = {
   ],
 };
 
+// ─── MY_SERIES ────────────────────────────────────────────────
+// Sent when a player runs .myseries. Variable line count.
+// First line:  📚 *My Series*
+// Data lines:  - SeriesName *(count)*
+// No explicit end line — last data line is the end.
+//
+// After normalize(): bold unicode → plain ASCII, so:
+//   first line becomes: 📚 *My Series*
+//   data lines:  - SeriesName *(count)*
+const MY_SERIES: MultiTemplate = {
+  id: 'MY_SERIES',
+  isStart: (line) => line === '📚 *My Series*',
+  isEnd: (line) => /^- .+ \*`\(\d+\)`\*$/.test(line),
+  extract: (lines) => {
+    const series: { name: string; count: number }[] = [];
+    for (const line of lines.slice(1)) {
+      const m = line.match(/^- (.+?) \*`\((\d+)\)`\*$/);
+      if (m) series.push({ name: m[1]!, count: parseInt(m[2]!, 10) });
+    }
+    if (series.length === 0) return null;
+    return { templateId: 'MY_SERIES', fields: { series } };
+  },
+};
+
+// ─── SERIES_LEADERBOARD ───────────────────────────────────────
+// Sent when a player runs .slb [series]. Variable line count.
+// Start: ╔═ ❰ 🏆 TOP COLLECTORS ❱ ═╗  (after normalize: same)
+// End:   ╚═════...═╝
+// Series line: ║ 📚 Series: <name>
+// Rank lines:  ║ 1. PlayerName
+// Count lines: ║ └ N cards
+const SERIES_LEADERBOARD: MultiTemplate = {
+  id: 'SERIES_LEADERBOARD',
+  isStart: (line) => line.includes('TOP COLLECTORS'),
+  isEnd: (line) => /^╚[═]+╝$/.test(line),
+  extract: (lines) => {
+    let series = '';
+    const leaders: { rank: number; name: string; count: number }[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      // Series name
+      const seriesMatch = line.match(/^║\s*📚\s*Series:\s*(.+)$/);
+      if (seriesMatch) { series = seriesMatch[1]!.trim(); continue; }
+      // Rank + name
+      const rankMatch = line.match(/^║\s*(\d+)\.\s*(.+)$/);
+      if (rankMatch) {
+        // Look ahead for count line
+        const nextLine = lines[i + 1] ?? '';
+        const countMatch = nextLine.match(/^║\s*└\s*(\d+)\s*cards?$/i);
+        leaders.push({
+          rank:  parseInt(rankMatch[1]!, 10),
+          name:  rankMatch[2]!.trim(),
+          count: countMatch ? parseInt(countMatch[1]!, 10) : 0,
+        });
+        if (countMatch) i++; // skip the count line
+      }
+    }
+
+    if (!series || leaders.length === 0) return null;
+    return { templateId: 'SERIES_LEADERBOARD', fields: { series, leaders } };
+  },
+};
+
+// ─── CARD_COLLECTION ──────────────────────────────────────────
+// Sent when a player runs .col. Variable line count.
+// Line 0: 🃏 *Your Card Collection*:
+// Lines:  N. 🃏 *Card Name* (Tier: X)
+// Owner = contextInfo.participant (Tensura bot replies to the person who ran .col)
+const CARD_COLLECTION: MultiTemplate = {
+  id: 'CARD_COLLECTION',
+  isStart: (line) => line === '🃏 *Your Card Collection*:',
+  isEnd:   (line) => /^\d+\.\s*🃏\s*\*.+\*\s*\(Tier:\s*\w+\)$/.test(line),
+  extract: (lines) => {
+    const cards: { name: string; tier: number }[] = [];
+    for (const line of lines) {
+      const m = line.match(/^\d+\.\s*🃏\s*\*(.+?)\*\s*\(Tier:\s*(\d+)\)/);
+      if (m) cards.push({ name: m[1]!.trim(), tier: parseInt(m[2]!, 10) });
+    }
+    if (cards.length === 0) return null;
+    return { templateId: 'CARD_COLLECTION', fields: { cards } };
+  },
+};
+
 // ─── Register all ─────────────────────────────────────────────
 export function registerTensuraTemplates(registry: Registry): void {
   registry.register(BOT_PING);
   registry.register(CARD_SPAWN);
-  registry.register(CLAIM_SUCCESS);
+  registry.registerMulti(CLAIM_SUCCESS);
   registry.register(CLAIM_TAKEN);
   registry.register(PLAYER_CMD_CLAIM);
+  registry.registerMulti(MY_SERIES);
+  registry.registerMulti(SERIES_LEADERBOARD);
+  registry.registerMulti(CARD_COLLECTION);
 }

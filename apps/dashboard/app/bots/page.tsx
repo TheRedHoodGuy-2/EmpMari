@@ -204,16 +204,17 @@ export default function BotsPage() {
               {/* Groups */}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                 {bot.groups.length === 0
-                  ? <span style={{ fontSize: 11, color: 'var(--muted)', fontStyle: 'italic' }}>—</span>
+                  ? <span style={{ fontSize: 11, color: 'var(--muted)', fontStyle: 'italic' }}>No groups seen</span>
                   : bot.groups.map(gc => (
                     <span key={gc.id} title={gc.id} style={{
                       fontSize: 11, padding: '2px 8px', borderRadius: 4,
                       background: 'rgba(255,255,255,0.05)',
                       border: '1px solid var(--border)',
-                      color: 'var(--text)',
+                      color: gc.name ? 'var(--text)' : 'var(--muted)',
                       whiteSpace: 'nowrap',
+                      fontStyle: gc.name ? 'normal' : 'italic',
                     }}>
-                      {gc.name ?? gc.id}
+                      {gc.name ?? 'Unnamed GC (run .gs to scan)'}
                     </span>
                   ))
                 }

@@ -8,6 +8,10 @@ import type { TypingSimulator } from '@mariabelle/humaniser';
 
 const attempted = new Set<string>(); // spawnIds we have sent .claim for
 
+// Send-latency recorder — injected from index.ts after bot connects
+let _recordSend: ((ms: number) => void) | null = null;
+export function setSendRecorder(fn: (ms: number) => void) { _recordSend = fn; }
+
 export function initClaimer(sock: WASocket, typingSim: TypingSimulator) {
   return {
     /**
@@ -24,7 +28,9 @@ export function initClaimer(sock: WASocket, typingSim: TypingSimulator) {
 
       console.log(`[CLAIMER] composing for ${Math.round(delayMs / 1000)}s — ${spawnId}`);
       await typingSim.composingFor(groupId, delayMs);
+      const t0 = Date.now();
       await sock.sendMessage(groupId, { text: `.claim ${spawnId}` });
+      _recordSend?.(Date.now() - t0);
       console.log(`[CLAIMER] .claim ${spawnId} sent`);
     },
 

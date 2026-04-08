@@ -8,6 +8,7 @@
 import { normalize } from './normalize.js';
 import type {
   Template,
+  MultiTemplate,
   LineRule,
   ParseResult,
   ParseTrace,
@@ -195,5 +196,31 @@ export function match(
 
   // If no candidates existed (lineCount mismatch for all templates),
   // we still return null — nothing to trace.
+  return null;
+}
+
+// ── multiMatch ────────────────────────────────────────────────
+// Tries a list of MultiTemplates against raw text.
+// Normalizes first, then finds the first template whose isStart()
+// matches the first line and isEnd() matches the last non-empty line.
+// Returns the first successful ParseResult, or null.
+
+export function multiMatch(
+  raw: string,
+  templates: MultiTemplate[],
+): ParseResult | null {
+  const normalized = normalize(raw);
+  const lines = normalized.split('\n');
+
+  for (const t of templates) {
+    if (!t.isStart(lines[0] ?? '')) continue;
+    // Find the last line matched by isEnd (scan from end)
+    let endIdx = lines.length - 1;
+    while (endIdx > 0 && lines[endIdx] === '') endIdx--;
+    if (!t.isEnd(lines[endIdx] ?? '')) continue;
+    const result = t.extract(lines);
+    if (result) return result;
+  }
+
   return null;
 }

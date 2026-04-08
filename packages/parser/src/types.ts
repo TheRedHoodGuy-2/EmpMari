@@ -46,10 +46,26 @@ export type ParseTrace = {
   result: ParseResult | null;
 };
 
+// ── MultiTemplate — for variable-line-count messages ─────────
+// Used when a message has a known start pattern but a variable
+// number of data lines (e.g. MY_SERIES, SERIES_LEADERBOARD).
+// multiMatch() in engine.ts handles these separately.
+
+export type MultiTemplate = {
+  id: string;
+  /** Return true if this line is the first line of the message */
+  isStart: (line: string) => boolean;
+  /** Return true if this line is the last line of the message */
+  isEnd: (line: string) => boolean;
+  /** Extract structured data from all lines */
+  extract: (lines: string[]) => ParseResult | null;
+};
+
 // Registry interface (returned by createRegistry)
 export type Registry = {
   register: (template: Template) => void;
   registerAll: (templates: Template[]) => void;
+  registerMulti: (template: MultiTemplate) => void;
   get: (id: string) => Template | undefined;
   getAll: () => Template[];
   parse: (raw: string) => ParseResult | null;

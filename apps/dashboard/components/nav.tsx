@@ -5,7 +5,7 @@ import { useState, useEffect } from 'react';
 import {
   Code2, Layers, TrendingUp, Bot,
   AlertTriangle, Trophy, SlidersHorizontal,
-  Menu, X, Radio, Activity, Shuffle, FlaskConical, Map,
+  Menu, X, Radio, Activity, Shuffle, FlaskConical, Map, BookOpen,
 } from 'lucide-react';
 
 type NavBadge = 'live' | 'soon' | 'lab';
@@ -25,6 +25,7 @@ const NAV: NavItem[] = [
   { href: '/card-detector', label: 'Card Detector',   Icon: FlaskConical,      badge: 'lab'  },
   { href: '/gambling',      label: 'Gambling',        Icon: TrendingUp,        badge: 'soon' },
   { href: '/groups',        label: 'Groups',          Icon: Map,               badge: 'live' },
+  { href: '/series',        label: 'Series',          Icon: BookOpen,          badge: 'live' },
   { href: '/bots',          label: 'Bots',            Icon: Bot,               badge: 'live' },
   { href: '/errors',        label: 'Errors',          Icon: AlertTriangle,     badge: 'soon' },
   { href: '/leaderboard',   label: 'Leaderboard',     Icon: Trophy,            badge: 'live' },
