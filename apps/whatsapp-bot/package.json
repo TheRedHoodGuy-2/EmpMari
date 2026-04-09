@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node --env-file=.env --import=tsx/esm src/index.ts",
     "build": "tsc",
-    "start": "node --env-file=.env dist/index.js"
+    "start": "tsx src/index.ts"
   },
   "dependencies": {
     "@mariabelle/activity-log": "file:../../packages/activity-log",

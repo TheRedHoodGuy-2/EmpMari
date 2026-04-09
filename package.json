@@ -1,6 +1,7 @@
 {
   "name": "mariabelle-v2",
   "private": true,
+  "packageManager": "pnpm@9.0.0",
   "version": "0.0.1",
   "scripts": {
     "test": "pnpm --filter @mariabelle/parser test"
