@@ -577,11 +577,8 @@ async function handleMessage(
     console.log(`[COL] CARD_COLLECTION owner → ${ownerJid} (${cards.length} cards)`);
 
     void (async () => {
-      // 1. Delete current collection for this jid+gc (handle null gc_id correctly)
-      const deleteQ = db.from('player_cards').delete().eq('jid', ownerJid);
-      const { error: delErr } = groupJid
-        ? await deleteQ.eq('gc_id', groupJid)
-        : await deleteQ.is('gc_id', null);
+      // 1. Delete ALL existing cards for this jid across all groups
+      const { error: delErr } = await db.from('player_cards').delete().eq('jid', ownerJid);
       if (delErr) console.error('[COL] delete error:', delErr.message);
 
       // 2. Batch-look up card_ids by name+tier — fetch all matching names then filter by tier in code
