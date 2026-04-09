@@ -1,3 +1,5 @@
+export const runtime = 'nodejs';
+
 import { NextRequest, NextResponse } from 'next/server';
 import { detectCard } from '@mariabelle/card-detector';
 import { join } from 'path';

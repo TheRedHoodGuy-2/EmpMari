@@ -29,6 +29,9 @@ importers:
       '@supabase/supabase-js':
         specifier: ^2.99.2
         version: 2.102.1
+      jimp:
+        specifier: '*'
+        version: 0.22.12
       lucide-react:
         specifier: ^0.577.0
         version: 0.577.0(react@19.2.5)
