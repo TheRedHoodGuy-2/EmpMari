@@ -11,7 +11,7 @@
     "@mariabelle/humaniser":     "file:../humaniser"
   },
   "peerDependencies": {
-    "@whiskeysockets/baileys": "^7",
+    "@whiskeysockets/baileys": ">=7.0.0-rc.0",
     "@supabase/supabase-js": "^2"
   },
   "devDependencies": {
