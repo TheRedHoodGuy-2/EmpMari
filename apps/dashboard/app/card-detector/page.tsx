@@ -1,7 +1,12 @@
 'use client';
 
 import { useRef, useState, useCallback, useEffect } from 'react';
-import type { DetectionResult } from '@mariabelle/card-detector';
+type DetectionResult = {
+  generation: 'old' | 'new' | 'unknown';
+  confidence: 'high' | 'medium' | 'low';
+  verdict: string;
+  signals: Record<string, unknown>;
+};
 
 // ── Styles ────────────────────────────────────────────────────
 
