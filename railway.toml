@@ -1,5 +1,0 @@
-[build]
-builder = "nixpacks"
-
-[build.env]
-NIXPACKS_PKGS = "nodejs_20"
