@@ -129,7 +129,51 @@ async function hydrateAttemptedSpawns() {
   console.log(`[CONN] Hydrated ${attemptedSpawns.size} attempted spawns from DB`);
 }
 
-// ── High-tier always-claim (T4/5/6/S bypass humaniser) ──────────
+// ── Claim-mode config cache (reads control_config, 10s TTL) ──────
+interface ClaimModeConfig {
+  claimMode:    'auto' | 'manual';
+  tierEnabled:  Record<string, boolean>; // '1'–'6', 'S' → enabled
+}
+let claimModeCache:     ClaimModeConfig | null = null;
+let claimModeCachedAt = 0;
+const CLAIM_MODE_TTL  = 10_000; // 10 seconds
+
+async function getClaimModeConfig(): Promise<ClaimModeConfig> {
+  if (claimModeCache && Date.now() - claimModeCachedAt < CLAIM_MODE_TTL) {
+    return claimModeCache;
+  }
+  const fallback: ClaimModeConfig = {
+    claimMode:   'auto',
+    tierEnabled: { '1':true,'2':true,'3':true,'4':true,'5':true,'6':true,'S':true,'s':true },
+  };
+  try {
+    const { data, error } = await db
+      .from('control_config')
+      .select('claim_mode,claim_tiers')
+      .eq('singleton', 'X')
+      .maybeSingle();
+    if (error || !data) {
+      console.warn('[CLAIM-MODE] Failed to load config — defaulting to auto:', error?.message ?? 'no row');
+      claimModeCache = fallback;
+    } else {
+      const enabledTiers: string[] = Array.isArray(data.claim_tiers) ? data.claim_tiers : ['1','2','3','4','5','6','S'];
+      const tierEnabled: Record<string, boolean> = {};
+      for (const t of enabledTiers) { tierEnabled[String(t)] = true; tierEnabled[String(t).toLowerCase()] = true; }
+      claimModeCache = {
+        claimMode: data.claim_mode === 'manual' ? 'manual' : 'auto',
+        tierEnabled,
+      };
+    }
+    claimModeCachedAt = Date.now();
+  } catch (e) {
+    console.warn('[CLAIM-MODE] Exception loading config — defaulting to auto:', (e as Error).message);
+    claimModeCache = fallback;
+    claimModeCachedAt = Date.now();
+  }
+  return claimModeCache!;
+}
+
+// ── High-tier always-claim (T4/5/6/S bypass humaniser in auto mode) ──
 const HIGH_TIERS = new Set(['4', '5', '6', 'S', 's']);
 
 // ── Delay system ─────────────────────────────────────────────────
@@ -692,12 +736,32 @@ async function handleMessage(
 
     // ── Decision ──────────────────────────────────────────────
     const tier = String(f.tier);
-    const activityScore = (await activityLog.getScore(targetGroup)).score;
+    const [modeConfig, activityScore] = await Promise.all([
+      getClaimModeConfig(),
+      activityLog.getScore(targetGroup).then(r => r.score),
+    ]);
+
+    const tierKey    = tier.toUpperCase() === 'S' ? 'S' : tier; // normalise
     const isHighTier = HIGH_TIERS.has(tier);
-    const delayMs = pickDelayMs(isHighTier);
-    const decision = isHighTier
-      ? { shouldClaim: true, delayMs, reason: `T${tier} always claim`, claimChance: 100, configUsed: 'high-tier' }
-      : { ...(await humaniser.decide({ tier, design: 'unknown', issue: f.issue, activityScore })), delayMs };
+    const delayMs    = pickDelayMs(isHighTier);
+
+    let decision: { shouldClaim: boolean; delayMs: number; reason: string; claimChance: number; configUsed: string };
+
+    if (modeConfig.claimMode === 'auto') {
+      // Auto: claim every spawn regardless of humaniser or tier filters
+      decision = { shouldClaim: true, delayMs, reason: 'auto mode — always claim', claimChance: 100, configUsed: 'auto' };
+    } else {
+      // Manual: check tier enabled first, then run humaniser
+      const tierAllowed = modeConfig.tierEnabled[tierKey] ?? modeConfig.tierEnabled[tier] ?? false;
+      if (!tierAllowed) {
+        decision = { shouldClaim: false, delayMs, reason: `manual mode — T${tier} disabled`, claimChance: 0, configUsed: 'manual-tier-filter' };
+      } else if (isHighTier) {
+        decision = { shouldClaim: true, delayMs, reason: `manual mode — T${tier} always claim`, claimChance: 100, configUsed: 'high-tier' };
+      } else {
+        const h = await humaniser.decide({ tier, design: 'unknown', issue: f.issue, activityScore });
+        decision = { ...h, delayMs };
+      }
+    }
 
     console.log(`[CARD] ${f.cardName} (${f.spawnId}) T${tier} #${f.issue} — ${decision.shouldClaim ? 'CLAIMING' : 'SKIPPING'} | delay=${(delayMs/1000).toFixed(2)}s | ${decision.reason}`);
 

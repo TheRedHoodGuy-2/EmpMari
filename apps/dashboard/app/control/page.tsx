@@ -85,6 +85,122 @@ function DelayInput({ ms, onChange }: { ms: number; onChange: (v: number) => voi
   );
 }
 
+const ALL_TIERS = ['1','2','3','4','5','6','S'] as const;
+
+function ClaimModeWidget() {
+  const [mode,    setMode]    = useState<'auto'|'manual'>('auto');
+  const [tiers,   setTiers]   = useState<string[]>([...ALL_TIERS]);
+  const [saving,  setSaving]  = useState(false);
+  const [msg,     setMsg]     = useState<string|null>(null);
+
+  useEffect(() => {
+    void fetch('/api/claim-mode')
+      .then(r => r.json())
+      .then((d: { claim_mode: 'auto'|'manual'; claim_tiers: string[] }) => {
+        setMode(d.claim_mode);
+        setTiers(d.claim_tiers);
+      });
+  }, []);
+
+  async function save(newMode: 'auto'|'manual', newTiers: string[]) {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await fetch('/api/claim-mode', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ claim_mode: newMode, claim_tiers: newTiers }),
+      });
+      if (!res.ok) throw new Error('Save failed');
+      setMsg('Saved');
+    } catch {
+      setMsg('Error');
+    } finally {
+      setSaving(false);
+      setTimeout(() => setMsg(null), 2000);
+    }
+  }
+
+  function toggleMode(m: 'auto'|'manual') {
+    setMode(m);
+    void save(m, tiers);
+  }
+
+  function toggleTier(t: string) {
+    const next = tiers.includes(t) ? tiers.filter(x => x !== t) : [...tiers, t];
+    setTiers(next);
+    void save(mode, next);
+  }
+
+  const tierColors: Record<string, { bg: string; color: string; border: string }> = {
+    '1': { bg: '#1f2937', color: '#9ca3af', border: '#374151' },
+    '2': { bg: '#1e3a5f', color: '#60a5fa', border: '#1e4a8f' },
+    '3': { bg: '#1a3a1a', color: '#4ade80', border: '#1a5a1a' },
+    '4': { bg: '#3b2d00', color: '#fbbf24', border: '#6b4d00' },
+    '5': { bg: '#4c1d1d', color: '#f87171', border: '#7c2d2d' },
+    '6': { bg: '#3b0764', color: '#c084fc', border: '#5b1794' },
+    'S': { bg: '#1a1a2e', color: '#818cf8', border: '#2a2a5e' },
+  };
+
+  return (
+    <div style={{
+      background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.08)',
+      borderRadius: 12, padding: '16px 20px', marginBottom: 24,
+      display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap',
+    }}>
+      {/* Mode toggle */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>Claim mode</span>
+        <div style={{ display: 'flex', borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
+          {(['auto','manual'] as const).map(m => (
+            <button
+              key={m}
+              onClick={() => toggleMode(m)}
+              style={{
+                fontSize: 12, padding: '5px 14px', cursor: 'pointer', fontWeight: 600,
+                background: mode === m ? (m === 'auto' ? '#16a34a' : '#2563eb') : 'rgba(255,255,255,0.04)',
+                color: mode === m ? '#fff' : 'var(--muted)',
+                border: 'none', textTransform: 'uppercase', letterSpacing: '0.04em',
+              }}
+            >{m}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Tier toggles — only meaningful in manual mode */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 11, color: mode === 'manual' ? 'var(--muted)' : 'rgba(255,255,255,0.2)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>Tiers</span>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {ALL_TIERS.map(t => {
+            const active = tiers.includes(t);
+            const c = tierColors[t]!;
+            return (
+              <button
+                key={t}
+                onClick={() => mode === 'manual' && toggleTier(t)}
+                title={mode === 'auto' ? 'Switch to manual to edit' : undefined}
+                style={{
+                  fontSize: 11, fontWeight: 700, padding: '4px 9px', borderRadius: 6,
+                  cursor: mode === 'manual' ? 'pointer' : 'default',
+                  background: active && mode === 'manual' ? c.bg : 'rgba(255,255,255,0.03)',
+                  color:      active && mode === 'manual' ? c.color : 'rgba(255,255,255,0.2)',
+                  border: `1px solid ${active && mode === 'manual' ? c.border : 'rgba(255,255,255,0.06)'}`,
+                  transition: 'all 0.15s',
+                }}
+              >T{t}</button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Status */}
+      <span style={{ fontSize: 12, color: saving ? 'var(--muted)' : msg === 'Saved' ? '#4ade80' : msg === 'Error' ? '#f87171' : 'transparent' }}>
+        {saving ? 'Saving…' : msg ?? '.'}
+      </span>
+    </div>
+  );
+}
+
 export default function ControlPage() {
   const [rows,      setRows]      = useState<ConfigRow[]>([]);
   const [edits,     setEdits]     = useState<EditMap>({});
@@ -196,6 +312,8 @@ export default function ControlPage() {
           </button>
         </div>
       </div>
+
+      <ClaimModeWidget />
 
       {loading ? (
         <div style={{ color: 'var(--muted)', fontSize: 13 }}>Loading config…</div>
