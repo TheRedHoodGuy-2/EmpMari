@@ -8,17 +8,14 @@
     "start": "next start"
   },
   "dependencies": {
-    "@mariabelle/card-detector": "file:../../packages/card-detector",
     "@mariabelle/identifier": "file:../../packages/identifier",
     "@mariabelle/parser": "file:../../packages/parser",
     "@supabase/ssr": "^0.9.0",
     "@supabase/supabase-js": "^2.99.2",
-    "jimp": "*",
     "lucide-react": "^0.577.0",
     "next": "^15.3.8",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "tesseract.js": "^5.1.1"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
