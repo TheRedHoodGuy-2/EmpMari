@@ -5,6 +5,7 @@ type DetectionResult = {
   generation: 'old' | 'new' | 'unknown';
   confidence: 'high' | 'medium' | 'low';
   verdict: string;
+  timingMs: number;
   signals: Record<string, unknown>;
 };
 
