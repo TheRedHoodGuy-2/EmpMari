@@ -6,6 +6,7 @@ import { patchConsole } from './console-colors.js';
 patchConsole(); // coloured terminal output — must be first
 
 import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
@@ -281,16 +282,28 @@ async function connectToWhatsApp(): Promise<void> {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       console.log('\n[CONN] Scan QR with Mariabelle\'s WhatsApp → Linked Devices:\n');
       qrcode.generate(qr, { small: true });
+      try {
+        const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
+        void db.from('control_config').upsert(
+          { singleton: 'X', qr_code: qrDataUrl, connection_status: 'disconnected' },
+          { onConflict: 'singleton' },
+        ).then(({ error }) => { if (error) console.error('[QR] store failed:', error.message); });
+      } catch (err) {
+        console.error('[QR] toDataURL failed:', err);
+      }
     }
     if (connection === 'open') {
       reconnectCount = 0;
       console.log('[MARIABELLE] Connected');
-      writeConnectionStatus('connected');
+      void db.from('control_config').upsert(
+        { singleton: 'X', qr_code: null, connection_status: 'connected', heartbeat_at: new Date().toISOString() },
+        { onConflict: 'singleton' },
+      ).then(({ error }) => { if (error) console.error('[CONN-STATUS]', error.message); });
       void humaniser.warmCache().then(() => console.log('[HUMANISER] Cache warmed'));
       void hydrateAttemptedSpawns();
       startHeartbeat();

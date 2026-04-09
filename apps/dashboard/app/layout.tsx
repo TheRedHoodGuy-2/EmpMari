@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import Nav from '@/components/nav';
+import QRModal from '@/components/QRModal';
 import ScrapeWidget from '@/components/scrape-widget';
 import BotStatusWidget from '@/components/bot-status-widget';
 import PageTransition from '@/components/page-transition';
@@ -25,6 +26,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         </div>
         <ScrapeWidget />
         <BotStatusWidget />
+        <QRModal />
       </body>
     </html>
   );
