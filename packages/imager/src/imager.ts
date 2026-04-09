@@ -10,6 +10,9 @@ const BUCKET = 'card-images';
 export function createImager(supabase: SupabaseClient) {
   return {
     async store(input: CardImageInput): Promise<StoredCardImage | null> {
+      console.log('[IMAGER] Starting store for spawnId:', input.spawnId);
+      console.log('[IMAGER] Buffer size:', input.imageBuffer?.length ?? 'null');
+      console.log('[IMAGER] Supabase URL set:', !!process.env['SUPABASE_URL']);
       const storagePath = `cards/${input.spawnId}.jpg`;
 
       // 1. Upload to Supabase Storage
