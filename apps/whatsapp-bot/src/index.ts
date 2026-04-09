@@ -713,8 +713,14 @@ async function handleMessage(
           'Content-Type': 'text/plain',
         },
         body: `Card: ${f.cardName}\nSpawn: ${f.spawnId}\nGroup: ${targetGroup}\nReason: ${decision.reason}`,
-      }).then(() => console.log('[NTFY] Sent'))
-        .catch((e: Error) => console.error('[NTFY] Failed:', e.message));
+      }).then(async (res) => {
+        const responseText = await res.text();
+        if (!res.ok) {
+          console.error(`[NTFY] Failed — status ${res.status}: ${responseText}`);
+        } else {
+          console.log(`[NTFY] Sent — status ${res.status} | ${responseText.slice(0, 80)}`);
+        }
+      }).catch((e: Error) => console.error('[NTFY] Failed:', e.message));
     }
 
     // ── Claim flow: pause → type → fire → retry ─────────────────
