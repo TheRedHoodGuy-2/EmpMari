@@ -384,18 +384,6 @@ async function handleMessage(
   const groupJid  = isGroupJid(remoteJid) ? remoteJid : null;
   const rawLid    = rawSender.endsWith('@lid') ? rawSender : null;
 
-  // ── RAW MESSAGE DEBUG ─────────────────────────────────────
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('pushName      :', msg.pushName ?? 'NULL');
-  console.log('remoteJid     :', msg.key.remoteJid);
-  console.log('participant   :', msg.key.participant ?? 'NULL');
-  console.log('remoteJidAlt  :', altRemote      ?? 'NULL');
-  console.log('participantAlt:', altParticipant ?? 'NULL');
-  console.log('rawSender     :', rawSender);
-  console.log('senderJid     :', senderJid);
-  console.log('isLid         :', rawSender.endsWith('@lid'));
-  console.log('text preview  :', rawText?.slice(0, 60) ?? 'NULL');
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   // Test GC image detection — handle before rawText guard
   if (hasImage && groupJid && groupJid === testGcJid) {
@@ -460,11 +448,6 @@ async function handleMessage(
   // ── Parse first (sync) ───────────────────────────────────
   const trace = registry.trace(rawText);
 
-  console.log('[DEBUG] messageId:', messageId);
-  console.log('[DEBUG] senderJid:', senderJid);
-  console.log('[DEBUG] hasImage:', hasImage);
-  console.log('[DEBUG] rawText first 80:', rawText?.slice(0, 80));
-  console.log('[DEBUG] templateId:', trace.result?.templateId ?? 'null');
 
   // ── GROUP_STATS detection ─────────────────────────────────
   // Triggered by .gs reply (full stats) or .anticamp on/off bot confirmation
@@ -832,7 +815,6 @@ async function handleMessage(
   // ── Classify ─────────────────────────────────────────────
   const classification = await classifier.classify(senderJid);
   const senderType     = classification.senderType;
-  console.log('[DEBUG] senderType:', senderType);
 
   // Auto-discovery: BOT_PING
   if (trace.result?.templateId === 'BOT_PING') {
