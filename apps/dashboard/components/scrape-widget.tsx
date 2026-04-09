@@ -65,9 +65,13 @@ export default function ScrapeWidget() {
 
   useEffect(() => {
     void poll();
+  }, [poll]);
+
+  useEffect(() => {
+    if (job.status !== 'running') return;
     const id = setInterval(() => void poll(), 1500);
     return () => clearInterval(id);
-  }, [poll]);
+  }, [job.status, poll]);
 
   async function start() {
     const res  = await fetch('/api/scrape', { method: 'POST' });
