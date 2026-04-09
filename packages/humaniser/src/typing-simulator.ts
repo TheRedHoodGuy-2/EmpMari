@@ -30,9 +30,9 @@ export interface TypingSimulatorOptions {
 
 /** Fast reply — suited for short commands like .claim */
 export const SHORT_BRACKETS: TypingBracket[] = [
-  { minMs: 300, maxMs: 550,  weight: 60 },
-  { minMs: 550, maxMs: 700,  weight: 30 },
-  { minMs: 700, maxMs: 850,  weight: 10 },
+  { minMs: 600,  maxMs: 900,  weight: 60 },
+  { minMs: 900,  maxMs: 1400, weight: 30 },
+  { minMs: 1400, maxMs: 2000, weight: 10 },
 ];
 
 /** Normal reply — suited for conversational messages */
