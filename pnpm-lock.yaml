@@ -14,9 +14,6 @@ importers:
 
   apps/dashboard:
     dependencies:
-      '@mariabelle/card-detector':
-        specifier: file:../../packages/card-detector
-        version: link:../../packages/card-detector
       '@mariabelle/identifier':
         specifier: file:../../packages/identifier
         version: link:../../packages/identifier
@@ -29,9 +26,6 @@ importers:
       '@supabase/supabase-js':
         specifier: ^2.99.2
         version: 2.102.1
-      jimp:
-        specifier: '*'
-        version: 0.22.12
       lucide-react:
         specifier: ^0.577.0
         version: 0.577.0(react@19.2.5)
@@ -39,14 +33,11 @@ importers:
         specifier: ^15.3.8
         version: 15.5.15(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       react:
-        specifier: ^19.0.0
+        specifier: ^19.2.5
         version: 19.2.5
       react-dom:
-        specifier: ^19.0.0
+        specifier: ^19.2.5
         version: 19.2.5(react@19.2.5)
-      tesseract.js:
-        specifier: ^5.1.1
-        version: 5.1.1
     devDependencies:
       '@tailwindcss/postcss':
         specifier: ^4
