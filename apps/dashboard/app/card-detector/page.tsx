@@ -132,7 +132,7 @@ function ResultPanel({ result }: { result: DetectionResult }) {
         <div style={{ fontSize: 12, color: 'var(--muted)', lineHeight: 1.6, fontFamily: 'monospace', background: 'rgba(0,0,0,0.2)', borderRadius: 8, padding: '10px 14px', marginBottom: 16 }}>
           {result.verdict}
         </div>
-        <CornerDepthRuler avg={s.avgCornerDepth} />
+        <CornerDepthRuler avg={Number(s.avgCornerDepth)} />
       </div>
 
       {/* SIGNALS TABLE */}
