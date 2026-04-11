@@ -854,8 +854,8 @@ async function handleMessage(
         claimInFlight.delete(targetGroup);
         awaitingConfirm.add(targetGroup);
         console.log(`[CLAIMER] .claim ${f.spawnId} sent | spawn→claim ${spawnToClaimMs}ms`);
-        void db.rpc('increment_claim_attempts', { p_spawn_id: f.spawnId });
-        void db.from('card_events').update({ spawn_to_claim_ms: spawnToClaimMs }).eq('spawn_id', f.spawnId);
+        const { error: fireErr } = await db.rpc('record_claim_fired', { p_spawn_id: f.spawnId, p_spawn_to_claim_ms: spawnToClaimMs });
+if (fireErr) console.error('[CLAIMER] record_claim_fired failed:', fireErr.message);
 
         // 7. NO RETRY — sending .claim twice risks cooldown/flag from Tensura.
         //    CLAIM_SUCCESS/CLAIM_TAKEN handlers clear awaitingConfirm when reply arrives.
