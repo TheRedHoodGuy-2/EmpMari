@@ -717,6 +717,9 @@ async function handleMessage(
       console.log(`[CARD] ${f.spawnId} already in memory — duplicate delivery ignored`);
       return;
     }
+    attemptedSpawns.add(f.spawnId); // lock immediately — before any await, kills race condition
+
+    // Layer 2: DB check — survives restarts/reconnects
 
     // Layer 2: DB check — survives restarts/reconnects
     const { data: existingRow } = await db
