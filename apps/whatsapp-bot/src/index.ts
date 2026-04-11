@@ -880,10 +880,12 @@ async function handleMessage(
             detectedAt:  new Date(),
           });
           if (stored) {
-            void db.from('card_events')
-              .update({ image_url: stored.publicUrl, image_id: stored.id })
-              .eq('spawn_id', f.spawnId);
-          }
+  const { error: imgUpdateErr } = await db.from('card_events')
+    .update({ image_url: stored.publicUrl, image_id: stored.id })
+    .eq('spawn_id', f.spawnId);
+  if (imgUpdateErr) console.error('[IMAGER] card_events update failed:', imgUpdateErr.message);
+  else console.log(`[IMAGER] card_events patched for ${f.spawnId}`);
+}
         } catch (e: unknown) {
           console.error('[IMAGE] Failed:', e instanceof Error ? e.message : String(e));
         }
