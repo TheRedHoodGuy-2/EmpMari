@@ -24,6 +24,7 @@ type CardEvent = {
   decision_reason: string | null;
   decision_delay_ms: number | null;
   spawn_to_claim_ms: number | null;
+  claim_attempts: number | null;
 };
 
 type Filter = 'all' | 'unclaimed' | 'claimed';
@@ -201,6 +202,16 @@ function CardTile({ card, tick, onDelete, groupName }: { card: CardEvent; tick: 
                 {(card.spawn_to_claim_ms / 1000).toFixed(2)}s
               </span>
             )}
+            {/* Fired count */}
+            {(card.claim_attempts ?? 0) > 0 && (
+              <span style={{
+                fontSize: 10, fontWeight: 700, padding: '1px 5px', borderRadius: 99,
+                background: card.claim_attempts === 1 ? 'rgba(96,165,250,0.12)' : 'rgba(251,146,60,0.15)',
+                color: card.claim_attempts === 1 ? '#60a5fa' : '#fb923c',
+              }}>
+                {card.claim_attempts}× fired
+              </span>
+            )}
           </div>
           {/* Decision row — always visible */}
           {card.decision_should_claim !== null && (
@@ -264,6 +275,9 @@ function CardTile({ card, tick, onDelete, groupName }: { card: CardEvent; tick: 
             card.claimed && card.claimed_at  ? ['Claimed at', relativeTime(card.claimed_at)]  : null,
             card.spawn_to_claim_ms != null
               ? ['Spawn → claim', <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{(card.spawn_to_claim_ms / 1000).toFixed(3)}s</span>] as [string, React.ReactNode]
+              : null,
+            (card.claim_attempts ?? 0) > 0
+              ? ['Fired', <span style={{ fontFamily: 'monospace', fontSize: 11, color: card.claim_attempts === 1 ? '#60a5fa' : '#fb923c' }}>{card.claim_attempts}× .claim sent</span>] as [string, React.ReactNode]
               : null,
           ] as ([string, React.ReactNode] | null)[])
             .filter((r): r is [string, React.ReactNode] => r !== null)

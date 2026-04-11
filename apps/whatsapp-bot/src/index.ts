@@ -717,9 +717,7 @@ async function handleMessage(
       console.log(`[CARD] ${f.spawnId} already in memory — duplicate delivery ignored`);
       return;
     }
-    attemptedSpawns.add(f.spawnId); // lock immediately — before any await, kills race condition
-
-    // Layer 2: DB check — survives restarts/reconnects
+    attemptedSpawns.add(f.spawnId); // lock immediately — before any await, kills the race condition
 
     // Layer 2: DB check — survives restarts/reconnects
     const { data: existingRow } = await db
@@ -800,7 +798,6 @@ async function handleMessage(
     // This ensures every detected spawn appears in the dashboard regardless of
     // whether we get to send .claim (e.g. another player claims first during our
     // delay window, which triggers claimCancelled and aborts the async below).
-    attemptedSpawns.add(f.spawnId);
     const { error: spawnUpsertErr } = await db.from('card_events').upsert({
       group_id:  targetGroup,
       spawn_id:  f.spawnId,
@@ -857,6 +854,7 @@ async function handleMessage(
         claimInFlight.delete(targetGroup);
         awaitingConfirm.add(targetGroup);
         console.log(`[CLAIMER] .claim ${f.spawnId} sent | spawn→claim ${spawnToClaimMs}ms`);
+        void db.rpc('increment_claim_attempts', { p_spawn_id: f.spawnId });
         void db.from('card_events').update({ spawn_to_claim_ms: spawnToClaimMs }).eq('spawn_id', f.spawnId);
 
         // 7. NO RETRY — sending .claim twice risks cooldown/flag from Tensura.
@@ -883,12 +881,10 @@ async function handleMessage(
             detectedAt:  new Date(),
           });
           if (stored) {
-  const { error: imgUpdateErr } = await db.from('card_events')
-    .update({ image_url: stored.publicUrl, image_id: stored.id })
-    .eq('spawn_id', f.spawnId);
-  if (imgUpdateErr) console.error('[IMAGER] card_events update failed:', imgUpdateErr.message);
-  else console.log(`[IMAGER] card_events patched for ${f.spawnId}`);
-}
+            void db.from('card_events')
+              .update({ image_url: stored.publicUrl, image_id: stored.id })
+              .eq('spawn_id', f.spawnId);
+          }
         } catch (e: unknown) {
           console.error('[IMAGE] Failed:', e instanceof Error ? e.message : String(e));
         }
