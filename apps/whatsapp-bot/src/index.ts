@@ -133,6 +133,7 @@ async function hydrateAttemptedSpawns() {
 interface ClaimModeConfig {
   claimMode:    'auto' | 'manual';
   tierEnabled:  Record<string, boolean>; // '1'–'6', 'S' → enabled
+  claimSpeed:   number; // multiplier: 0.5 = 2× faster, 1.0 = default, 2.0 = cautious
 }
 let claimModeCache:     ClaimModeConfig | null = null;
 let claimModeCachedAt = 0;
@@ -145,11 +146,12 @@ async function getClaimModeConfig(): Promise<ClaimModeConfig> {
   const fallback: ClaimModeConfig = {
     claimMode:   'auto',
     tierEnabled: { '1':true,'2':true,'3':true,'4':true,'5':true,'6':true,'S':true,'s':true },
+    claimSpeed:  1.0,
   };
   try {
     const { data, error } = await db
       .from('control_config')
-      .select('claim_mode,claim_tiers')
+      .select('claim_mode,claim_tiers,claim_speed')
       .eq('singleton', 'X')
       .maybeSingle();
     if (error || !data) {
@@ -159,9 +161,11 @@ async function getClaimModeConfig(): Promise<ClaimModeConfig> {
       const enabledTiers: string[] = Array.isArray(data.claim_tiers) ? data.claim_tiers : ['1','2','3','4','5','6','S'];
       const tierEnabled: Record<string, boolean> = {};
       for (const t of enabledTiers) { tierEnabled[String(t)] = true; tierEnabled[String(t).toLowerCase()] = true; }
+      const rawSpeed = typeof data.claim_speed === 'number' ? data.claim_speed : 1.0;
       claimModeCache = {
         claimMode: data.claim_mode === 'manual' ? 'manual' : 'auto',
         tierEnabled,
+        claimSpeed: Math.max(0.1, Math.min(3.0, rawSpeed)), // clamp to safe range
       };
     }
     claimModeCachedAt = Date.now();
@@ -732,6 +736,7 @@ async function handleMessage(
       return;
     }
     claimInFlight.add(targetGroup);
+    claimCancelled.delete(targetGroup); // clear any stale cancel from a previous spawn in this group
     const spawnDetectedAt = Date.now(); // exact moment spawn message arrived
 
     // ── Decision ──────────────────────────────────────────────
@@ -743,7 +748,8 @@ async function handleMessage(
 
     const tierKey    = tier.toUpperCase() === 'S' ? 'S' : tier; // normalise
     const isHighTier = HIGH_TIERS.has(tier);
-    const delayMs    = pickDelayMs(isHighTier);
+    const delayMs    = Math.round(pickDelayMs(isHighTier) * modeConfig.claimSpeed);
+    const prePauseMs = Math.round((200 + Math.random() * 300) * modeConfig.claimSpeed);
 
     let decision: { shouldClaim: boolean; delayMs: number; reason: string; claimChance: number; configUsed: string };
 
@@ -787,71 +793,81 @@ async function handleMessage(
       }).catch((e: Error) => console.error('[NTFY] Failed:', e.message));
     }
 
-    // ── Claim flow: pause → type → fire → retry ─────────────────
+    // ── Write spawn to DB immediately — before any delay or cancellation check.
+    // This ensures every detected spawn appears in the dashboard regardless of
+    // whether we get to send .claim (e.g. another player claims first during our
+    // delay window, which triggers claimCancelled and aborts the async below).
+    attemptedSpawns.add(f.spawnId);
+    const { error: spawnUpsertErr } = await db.from('card_events').upsert({
+      group_id:  targetGroup,
+      spawn_id:  f.spawnId,
+      card_name: f.cardName,
+      tier:      String(f.tier),
+      price:     f.price,
+      issue:     f.issue,
+      claimed:   false,
+      decision_should_claim: decision.shouldClaim,
+      decision_reason:       decision.reason,
+    }, { onConflict: 'spawn_id' });
+    if (spawnUpsertErr) console.error('[CARD_EVENTS] Initial upsert failed:', spawnUpsertErr.message);
+
+    // ── Claim flow: pause → type → fire ──────────────────────────
     // Bot/sender already verified in Gate 1 above — proceed directly.
     void (async () => {
-      // 1. If skipping — do nothing, no typing flash, no tell
-      if (!decision.shouldClaim) {
-        claimInFlight.delete(targetGroup);
-        return;
-      }
+      try {
+        // 1. If skipping — do nothing, no typing flash, no tell
+        if (!decision.shouldClaim) {
+          claimInFlight.delete(targetGroup);
+          return;
+        }
 
-      // 2. Pre-typing pause — 200–500ms for all tiers
-      const prePause = 200 + Math.random() * 300;
-      await new Promise<void>(r => setTimeout(r, prePause));
+        // 2. Pre-typing pause — scaled by claimSpeed
+        await new Promise<void>(r => setTimeout(r, prePauseMs));
 
-      // 4. Typing starts — stays on until we fire
-      typingSim.startLoop(targetGroup);
-      const typingStartedAt = Date.now();
+        // 3. Typing starts — stays on until we fire
+        typingSim.startLoop(targetGroup);
+        const typingStartedAt = Date.now();
 
-      // 5. Wait remainder of humaniser delay (subtract time already elapsed)
-      const elapsed  = Date.now() - typingStartedAt;
-      const remainMs = Math.max(300, decision.delayMs - elapsed);
-      await new Promise<void>(r => setTimeout(r, remainMs));
+        // 4. Wait remainder of humaniser delay (subtract time already elapsed)
+        const elapsed  = Date.now() - typingStartedAt;
+        const remainMs = Math.max(300, decision.delayMs - elapsed);
+        await new Promise<void>(r => setTimeout(r, remainMs));
 
-      // 6. Check if someone else claimed while we were waiting
-      if (claimCancelled.has(targetGroup)) {
-        claimCancelled.delete(targetGroup);
+        // 5. Check if someone else claimed while we were waiting
+        if (claimCancelled.has(targetGroup)) {
+          claimCancelled.delete(targetGroup);
+          typingSim.stopLoop(targetGroup);
+          claimInFlight.delete(targetGroup);
+          console.log(`[CLAIMER] ${f.spawnId} cancelled — another player claimed first`);
+          // Row is already in DB (written above) — update reason so dashboard reflects this
+          void db.from('card_events')
+            .update({ decision_reason: 'cancelled — claimed by another player' })
+            .eq('spawn_id', f.spawnId);
+          return;
+        }
+
+        // 6. Fire — message first, stop typing after (no gap)
+        pendingClaims.set(f.cardName, f.spawnId);
+        const spawnToClaimMs = Date.now() - spawnDetectedAt;
+        await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
         typingSim.stopLoop(targetGroup);
         claimInFlight.delete(targetGroup);
-        console.log(`[CLAIMER] ${f.spawnId} cancelled — already taken`);
-        return;
+        awaitingConfirm.add(targetGroup);
+        console.log(`[CLAIMER] .claim ${f.spawnId} sent | spawn→claim ${spawnToClaimMs}ms`);
+        void db.from('card_events').update({ spawn_to_claim_ms: spawnToClaimMs }).eq('spawn_id', f.spawnId);
+
+        // 7. NO RETRY — sending .claim twice risks cooldown/flag from Tensura.
+        //    CLAIM_SUCCESS/CLAIM_TAKEN handlers clear awaitingConfirm when reply arrives.
+      } catch (err) {
+        typingSim.stopLoop(targetGroup);
+        claimInFlight.delete(targetGroup);
+        console.error(`[CLAIMER] Claim flow failed for ${f.spawnId}:`, (err as Error).message);
       }
-
-      // 7. Mark spawnId attempted in memory AND DB before sending — if bot
-      //    restarts between here and sendMessage, the next delivery sees the
-      //    DB row (layer 2 check above) and skips. No duplicate sends ever.
-      attemptedSpawns.add(f.spawnId);
-      await db.from('card_events').upsert({
-        group_id:  targetGroup,
-        spawn_id:  f.spawnId,
-        card_name: f.cardName,
-        tier:      String(f.tier),
-        price:     f.price,
-        issue:     f.issue,
-        claimed:   false,
-        decision_should_claim: decision.shouldClaim,
-        decision_reason:       decision.reason,
-      }, { onConflict: 'spawn_id' });
-
-      // 8. Fire — message first, stop typing after (no gap)
-      pendingClaims.set(f.cardName, f.spawnId);
-      const spawnToClaimMs = Date.now() - spawnDetectedAt;
-      await sock.sendMessage(targetGroup, { text: `.claim ${f.spawnId}` });
-      typingSim.stopLoop(targetGroup);
-      claimInFlight.delete(targetGroup);
-      awaitingConfirm.add(targetGroup);
-      console.log(`[CLAIMER] .claim ${f.spawnId} sent | spawn→claim ${spawnToClaimMs}ms`);
-      void db.from('card_events').update({ spawn_to_claim_ms: spawnToClaimMs }).eq('spawn_id', f.spawnId);
-
-      // 9. NO RETRY — sending .claim twice risks cooldown/flag from Tensura.
-      //    CLAIM_SUCCESS/CLAIM_TAKEN handlers clear awaitingConfirm when reply arrives.
-      //    If no reply comes the card was likely already taken; we already have the DB row.
     })();
 
     void (async () => {
-      // Row is already in DB (written before .claim was sent).
-      // Download image if present and patch it onto the existing row.
+      // Row is already in DB (written immediately above).
+      // Download image and patch image_url onto the existing row.
       if (hasImage) {
         try {
           const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});

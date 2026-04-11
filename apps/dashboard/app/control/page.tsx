@@ -90,26 +90,28 @@ const ALL_TIERS = ['1','2','3','4','5','6','S'] as const;
 function ClaimModeWidget() {
   const [mode,    setMode]    = useState<'auto'|'manual'>('auto');
   const [tiers,   setTiers]   = useState<string[]>([...ALL_TIERS]);
+  const [speed,   setSpeed]   = useState<number>(1.0);
   const [saving,  setSaving]  = useState(false);
   const [msg,     setMsg]     = useState<string|null>(null);
 
   useEffect(() => {
     void fetch('/api/claim-mode')
       .then(r => r.json())
-      .then((d: { claim_mode: 'auto'|'manual'; claim_tiers: string[] }) => {
+      .then((d: { claim_mode: 'auto'|'manual'; claim_tiers: string[]; claim_speed: number }) => {
         setMode(d.claim_mode);
         setTiers(d.claim_tiers);
+        setSpeed(d.claim_speed ?? 1.0);
       });
   }, []);
 
-  async function save(newMode: 'auto'|'manual', newTiers: string[]) {
+  async function save(newMode: 'auto'|'manual', newTiers: string[], newSpeed: number) {
     setSaving(true);
     setMsg(null);
     try {
       const res = await fetch('/api/claim-mode', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ claim_mode: newMode, claim_tiers: newTiers }),
+        body: JSON.stringify({ claim_mode: newMode, claim_tiers: newTiers, claim_speed: newSpeed }),
       });
       if (!res.ok) throw new Error('Save failed');
       setMsg('Saved');
@@ -123,14 +125,30 @@ function ClaimModeWidget() {
 
   function toggleMode(m: 'auto'|'manual') {
     setMode(m);
-    void save(m, tiers);
+    void save(m, tiers, speed);
   }
 
   function toggleTier(t: string) {
     const next = tiers.includes(t) ? tiers.filter(x => x !== t) : [...tiers, t];
     setTiers(next);
-    void save(mode, next);
+    void save(mode, next, speed);
   }
+
+  function changeSpeed(v: number) {
+    setSpeed(v);
+    void save(mode, tiers, v);
+  }
+
+  // Speed presets: label, multiplier, colour
+  const SPEED_PRESETS: { label: string; value: number; color: string }[] = [
+    { label: 'Turbo',   value: 0.4, color: '#f87171' },
+    { label: 'Fast',    value: 0.7, color: '#fb923c' },
+    { label: 'Normal',  value: 1.0, color: '#4ade80' },
+    { label: 'Casual',  value: 1.5, color: '#60a5fa' },
+    { label: 'Slow',    value: 2.2, color: '#a78bfa' },
+  ];
+
+  const activePreset = SPEED_PRESETS.find(p => Math.abs(p.value - speed) < 0.05);
 
   const tierColors: Record<string, { bg: string; color: string; border: string }> = {
     '1': { bg: '#1f2937', color: '#9ca3af', border: '#374151' },
@@ -146,57 +164,107 @@ function ClaimModeWidget() {
     <div style={{
       background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.08)',
       borderRadius: 12, padding: '16px 20px', marginBottom: 24,
-      display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap',
+      display: 'flex', flexDirection: 'column', gap: 14,
     }}>
-      {/* Mode toggle */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>Claim mode</span>
-        <div style={{ display: 'flex', borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
-          {(['auto','manual'] as const).map(m => (
-            <button
-              key={m}
-              onClick={() => toggleMode(m)}
-              style={{
-                fontSize: 12, padding: '5px 14px', cursor: 'pointer', fontWeight: 600,
-                background: mode === m ? (m === 'auto' ? '#16a34a' : '#2563eb') : 'rgba(255,255,255,0.04)',
-                color: mode === m ? '#fff' : 'var(--muted)',
-                border: 'none', textTransform: 'uppercase', letterSpacing: '0.04em',
-              }}
-            >{m}</button>
-          ))}
+      {/* Row 1: mode + tiers */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap' }}>
+        {/* Mode toggle */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>Claim mode</span>
+          <div style={{ display: 'flex', borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
+            {(['auto','manual'] as const).map(m => (
+              <button
+                key={m}
+                onClick={() => toggleMode(m)}
+                style={{
+                  fontSize: 12, padding: '5px 14px', cursor: 'pointer', fontWeight: 600,
+                  background: mode === m ? (m === 'auto' ? '#16a34a' : '#2563eb') : 'rgba(255,255,255,0.04)',
+                  color: mode === m ? '#fff' : 'var(--muted)',
+                  border: 'none', textTransform: 'uppercase', letterSpacing: '0.04em',
+                }}
+              >{m}</button>
+            ))}
+          </div>
         </div>
+
+        {/* Tier toggles */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: mode === 'manual' ? 'var(--muted)' : 'rgba(255,255,255,0.2)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>Tiers</span>
+          <div style={{ display: 'flex', gap: 4 }}>
+            {ALL_TIERS.map(t => {
+              const active = tiers.includes(t);
+              const c = tierColors[t]!;
+              return (
+                <button
+                  key={t}
+                  onClick={() => mode === 'manual' && toggleTier(t)}
+                  title={mode === 'auto' ? 'Switch to manual to edit' : undefined}
+                  style={{
+                    fontSize: 11, fontWeight: 700, padding: '4px 9px', borderRadius: 6,
+                    cursor: mode === 'manual' ? 'pointer' : 'default',
+                    background: active && mode === 'manual' ? c.bg : 'rgba(255,255,255,0.03)',
+                    color:      active && mode === 'manual' ? c.color : 'rgba(255,255,255,0.2)',
+                    border: `1px solid ${active && mode === 'manual' ? c.border : 'rgba(255,255,255,0.06)'}`,
+                    transition: 'all 0.15s',
+                  }}
+                >T{t}</button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Status */}
+        <span style={{ fontSize: 12, color: saving ? 'var(--muted)' : msg === 'Saved' ? '#4ade80' : msg === 'Error' ? '#f87171' : 'transparent', marginLeft: 'auto' }}>
+          {saving ? 'Saving…' : msg ?? '.'}
+        </span>
       </div>
 
-      {/* Tier toggles — only meaningful in manual mode */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 11, color: mode === 'manual' ? 'var(--muted)' : 'rgba(255,255,255,0.2)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>Tiers</span>
+      {/* Row 2: speed dial */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500, whiteSpace: 'nowrap' }}>
+          Claim speed
+        </span>
+        {/* Preset buttons */}
         <div style={{ display: 'flex', gap: 4 }}>
-          {ALL_TIERS.map(t => {
-            const active = tiers.includes(t);
-            const c = tierColors[t]!;
+          {SPEED_PRESETS.map(p => {
+            const isActive = Math.abs(p.value - speed) < 0.05;
             return (
               <button
-                key={t}
-                onClick={() => mode === 'manual' && toggleTier(t)}
-                title={mode === 'auto' ? 'Switch to manual to edit' : undefined}
+                key={p.label}
+                onClick={() => changeSpeed(p.value)}
                 style={{
-                  fontSize: 11, fontWeight: 700, padding: '4px 9px', borderRadius: 6,
-                  cursor: mode === 'manual' ? 'pointer' : 'default',
-                  background: active && mode === 'manual' ? c.bg : 'rgba(255,255,255,0.03)',
-                  color:      active && mode === 'manual' ? c.color : 'rgba(255,255,255,0.2)',
-                  border: `1px solid ${active && mode === 'manual' ? c.border : 'rgba(255,255,255,0.06)'}`,
-                  transition: 'all 0.15s',
+                  fontSize: 11, fontWeight: 600, padding: '4px 10px', borderRadius: 6,
+                  cursor: 'pointer', transition: 'all 0.15s',
+                  background: isActive ? `${p.color}22` : 'rgba(255,255,255,0.03)',
+                  color:      isActive ? p.color : 'rgba(255,255,255,0.3)',
+                  border:     `1px solid ${isActive ? p.color + '66' : 'rgba(255,255,255,0.07)'}`,
                 }}
-              >T{t}</button>
+              >{p.label}</button>
             );
           })}
         </div>
+        {/* Fine-tune slider */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.2)' }}>0.1×</span>
+          <input
+            type="range" min={0.1} max={3.0} step={0.05}
+            value={speed}
+            onChange={e => setSpeed(Number(e.target.value))}
+            onMouseUp={e  => changeSpeed(Number((e.target as HTMLInputElement).value))}
+            onTouchEnd={e => changeSpeed(Number((e.target as HTMLInputElement).value))}
+            style={{ width: 100, accentColor: activePreset?.color ?? '#818cf8', cursor: 'pointer' }}
+          />
+          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.2)' }}>3×</span>
+          <span style={{
+            fontSize: 11, fontWeight: 700, minWidth: 34, textAlign: 'right',
+            color: activePreset?.color ?? '#818cf8',
+          }}>{speed.toFixed(2)}×</span>
+        </div>
+        <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.25)', whiteSpace: 'nowrap' }}>
+          {speed < 1 ? `~${Math.round(500 * speed)}–${Math.round(2000 * speed)}ms delays`
+                     : `~${Math.round(500 * speed)}–${Math.round(2000 * speed)}ms delays`}
+        </span>
       </div>
-
-      {/* Status */}
-      <span style={{ fontSize: 12, color: saving ? 'var(--muted)' : msg === 'Saved' ? '#4ade80' : msg === 'Error' ? '#f87171' : 'transparent' }}>
-        {saving ? 'Saving…' : msg ?? '.'}
-      </span>
     </div>
   );
 }
