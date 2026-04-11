@@ -279,6 +279,41 @@ function startHeartbeat() {
 }
 
 // ── WhatsApp connection ──────────────────────────────────────
+let _activeSock: WASocket | null = null;
+
+// ── Command queue — dashboard sends commands via command_queue table ──
+// Polls every 3s, fires pending commands, marks as sent/error.
+let commandQueueTimer: ReturnType<typeof setInterval> | null = null;
+
+function startCommandQueue(getSock: () => WASocket | null) {
+  if (commandQueueTimer) clearInterval(commandQueueTimer);
+  commandQueueTimer = setInterval(async () => {
+    try {
+      const { data: rows } = await db
+        .from('command_queue')
+        .select('id,group_id,command')
+        .eq('status', 'pending')
+        .order('created_at', { ascending: true })
+        .limit(5);
+
+      for (const row of rows ?? []) {
+        const sock = getSock();
+        if (!sock) continue;
+        try {
+          await db.from('command_queue').update({ status: 'sending', sent_at: new Date().toISOString() }).eq('id', row.id);
+          await sock.sendMessage(row.group_id as string, { text: row.command as string });
+          await db.from('command_queue').update({ status: 'sent' }).eq('id', row.id);
+          console.log(`[CMD-QUEUE] Sent "${row.command as string}" → ${row.group_id as string}`);
+        } catch (e) {
+          await db.from('command_queue').update({ status: 'error' }).eq('id', row.id);
+          console.error(`[CMD-QUEUE] Failed:`, (e as Error).message);
+        }
+      }
+    } catch { /* non-fatal */ }
+  }, 3_000);
+  console.log('[CMD-QUEUE] Polling started (3s interval)');
+}
+
 async function connectToWhatsApp(): Promise<void> {
   const selfNumber = process.env['SELF_NUMBER'] as string;
   const classifier = createClassifier(db, selfNumber);
@@ -347,6 +382,7 @@ async function connectToWhatsApp(): Promise<void> {
     }
     if (connection === 'open') {
       reconnectCount = 0;
+      _activeSock = sock;
       console.log('[MARIABELLE] Connected');
       void db.from('control_config').upsert(
         { singleton: 'X', qr_code: null, connection_status: 'connected', heartbeat_at: new Date().toISOString() },
@@ -356,11 +392,13 @@ async function connectToWhatsApp(): Promise<void> {
       void hydrateAttemptedSpawns();
       startHeartbeat();
       startLatencyFlush();
+      startCommandQueue(() => _activeSock);
     }
     if (connection === 'connecting') {
       writeConnectionStatus('connecting');
     }
     if (connection === 'close') {
+      _activeSock = null;
       writeConnectionStatus('disconnected');
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode ?? 0;
       const loggedOut  = statusCode === DisconnectReason.loggedOut;
@@ -717,7 +755,6 @@ async function handleMessage(
       console.log(`[CARD] ${f.spawnId} already in memory — duplicate delivery ignored`);
       return;
     }
-    attemptedSpawns.add(f.spawnId); // lock immediately — before any await, kills the race condition
 
     // Layer 2: DB check — survives restarts/reconnects
     const { data: existingRow } = await db
@@ -798,6 +835,7 @@ async function handleMessage(
     // This ensures every detected spawn appears in the dashboard regardless of
     // whether we get to send .claim (e.g. another player claims first during our
     // delay window, which triggers claimCancelled and aborts the async below).
+    attemptedSpawns.add(f.spawnId);
     const { error: spawnUpsertErr } = await db.from('card_events').upsert({
       group_id:  targetGroup,
       spawn_id:  f.spawnId,
@@ -854,8 +892,8 @@ async function handleMessage(
         claimInFlight.delete(targetGroup);
         awaitingConfirm.add(targetGroup);
         console.log(`[CLAIMER] .claim ${f.spawnId} sent | spawn→claim ${spawnToClaimMs}ms`);
-        const { error: fireErr } = await db.rpc('record_claim_fired', { p_spawn_id: f.spawnId, p_spawn_to_claim_ms: spawnToClaimMs });
-if (fireErr) console.error('[CLAIMER] record_claim_fired failed:', fireErr.message);
+        void db.rpc('increment_claim_attempts', { p_spawn_id: f.spawnId });
+        void db.from('card_events').update({ spawn_to_claim_ms: spawnToClaimMs }).eq('spawn_id', f.spawnId);
 
         // 7. NO RETRY — sending .claim twice risks cooldown/flag from Tensura.
         //    CLAIM_SUCCESS/CLAIM_TAKEN handlers clear awaitingConfirm when reply arrives.
